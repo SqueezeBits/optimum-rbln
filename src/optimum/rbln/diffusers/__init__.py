@@ -28,11 +28,13 @@ ALL_IMPORTABLE_CLASSES.update(LOADABLE_CLASSES["optimum.rbln"])
 _import_structure = {
     "configurations": [
         "RBLNAutoencoderKLConfig",
+        "RBLNAutoencoderKLFlux2Config",
         "RBLNAutoencoderKLCosmosConfig",
         "RBLNControlNetModelConfig",
         "RBLNCosmosTextToWorldPipelineConfig",
         "RBLNCosmosVideoToWorldPipelineConfig",
         "RBLNCosmosTransformer3DModelConfig",
+        "RBLNFlux2KleinPipelineConfig",
         "RBLNKandinskyV22CombinedPipelineConfig",
         "RBLNKandinskyV22Img2ImgCombinedPipelineConfig",
         "RBLNKandinskyV22Img2ImgPipelineConfig",
@@ -68,6 +70,7 @@ _import_structure = {
         "RBLNCosmosTextToWorldPipeline",
         "RBLNCosmosVideoToWorldPipeline",
         "RBLNCosmosSafetyChecker",
+        "RBLNFlux2KleinPipeline",
         "RBLNKandinskyV22CombinedPipeline",
         "RBLNKandinskyV22Img2ImgCombinedPipeline",
         "RBLNKandinskyV22InpaintCombinedPipeline",
@@ -93,6 +96,7 @@ _import_structure = {
     ],
     "models": [
         "RBLNAutoencoderKL",
+        "RBLNAutoencoderKLFlux2",
         "RBLNAutoencoderKLCosmos",
         "RBLNUNet2DConditionModel",
         "RBLNUNetSpatioTemporalConditionModel",
@@ -111,12 +115,14 @@ _import_structure = {
 if TYPE_CHECKING:
     from .configurations import (
         RBLNAutoencoderKLConfig,
+        RBLNAutoencoderKLFlux2Config,
         RBLNAutoencoderKLCosmosConfig,
         RBLNAutoencoderKLTemporalDecoderConfig,
         RBLNControlNetModelConfig,
         RBLNCosmosTextToWorldPipelineConfig,
         RBLNCosmosTransformer3DModelConfig,
         RBLNCosmosVideoToWorldPipelineConfig,
+        RBLNFlux2KleinPipelineConfig,
         RBLNKandinskyV22CombinedPipelineConfig,
         RBLNKandinskyV22Img2ImgCombinedPipelineConfig,
         RBLNKandinskyV22Img2ImgPipelineConfig,
@@ -147,6 +153,7 @@ if TYPE_CHECKING:
     from .modeling_diffusers import RBLNDiffusionMixin
     from .models import (
         RBLNAutoencoderKL,
+        RBLNAutoencoderKLFlux2,
         RBLNAutoencoderKLCosmos,
         RBLNAutoencoderKLTemporalDecoder,
         RBLNControlNetModel,
@@ -164,6 +171,7 @@ if TYPE_CHECKING:
         RBLNCosmosSafetyChecker,
         RBLNCosmosTextToWorldPipeline,
         RBLNCosmosVideoToWorldPipeline,
+        RBLNFlux2KleinPipeline,
         RBLNKandinskyV22CombinedPipeline,
         RBLNKandinskyV22Img2ImgCombinedPipeline,
         RBLNKandinskyV22Img2ImgPipeline,

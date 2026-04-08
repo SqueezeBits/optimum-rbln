@@ -20,6 +20,7 @@ from transformers.utils import _LazyModule
 _import_structure = {
     "autoencoders": [
         "RBLNAutoencoderKL",
+        "RBLNAutoencoderKLFlux2",
         "RBLNAutoencoderKLCosmos",
         "RBLNVQModel",
         "RBLNAutoencoderKLTemporalDecoder",
@@ -39,6 +40,7 @@ _import_structure = {
 if TYPE_CHECKING:
     from .autoencoders import (
         RBLNAutoencoderKL,
+        RBLNAutoencoderKLFlux2,
         RBLNAutoencoderKLCosmos,
         RBLNAutoencoderKLTemporalDecoder,
         RBLNVQModel,

@@ -1,4 +1,5 @@
 from .configuration_autoencoder_kl import RBLNAutoencoderKLConfig
+from .configuration_autoencoder_kl_flux2 import RBLNAutoencoderKLFlux2Config
 from .configuration_autoencoder_kl_cosmos import RBLNAutoencoderKLCosmosConfig
 from .configuration_autoencoder_kl_temporal_decoder import RBLNAutoencoderKLTemporalDecoderConfig
 from .configuration_controlnet import RBLNControlNetModelConfig

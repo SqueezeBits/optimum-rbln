@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import TYPE_CHECKING
 
 from ....utils import logging
 from ...models.decoderonly import (
@@ -19,6 +20,9 @@ from ...models.decoderonly import (
     RBLNDecoderOnlyModelForCausalLM,
 )
 from .qwen3_architecture import Qwen3Wrapper
+
+if TYPE_CHECKING:
+    from ....diffusers.modeling_diffusers import RBLNDiffusionMixin, RBLNDiffusionMixinConfig
 
 
 logger = logging.get_logger(__name__)
@@ -80,6 +84,13 @@ class RBLNQwen3ForCausalLM(RBLNDecoderOnlyModelForCausalLM):
     def forward(self, *args, **kwargs):
         kwargs["return_dict"] = True
         return super().forward(*args, **kwargs)
+
+    @classmethod
+    def update_rbln_config_using_pipe(
+        cls, pipe: "RBLNDiffusionMixin", rbln_config: "RBLNDiffusionMixinConfig", submodule_name: str
+    ) -> "RBLNDiffusionMixinConfig":
+        # ZImage uses Qwen3 as a diffusion text encoder.
+        return rbln_config
 
 
 class RBLNQwen3Model(RBLNDecoderOnlyModel):
