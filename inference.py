@@ -1,5 +1,6 @@
 import argparse
 import os
+import time
 
 import torch
 
@@ -40,6 +41,7 @@ def main():
 
     if args.use_diffusers_transformer:
         os.environ["USE_DIFFUSERS_TRANSFORMER"] = "1"
+    else:
         rbln_config["transformer"] = {"device": 1}
 
     # Load compiled model
@@ -52,7 +54,10 @@ def main():
     # Generate image
     torch.manual_seed(args.seed)
     generator = torch.Generator(device=pipe.device).manual_seed(args.seed)
-    image = pipe(prompt=prompt, num_inference_steps=4, guidance_scale=1.0, generator=generator).images[0]
+    start_time = time.perf_counter()
+    image = pipe(prompt=prompt, num_inference_steps=4, guidance_scale=1.0, generator=generator, height=1024, width=1024).images[0]
+    end_time = time.perf_counter()
+    print(f"Time taken: {end_time - start_time} seconds")
 
     # Save image result
     image.save(f"output.png")

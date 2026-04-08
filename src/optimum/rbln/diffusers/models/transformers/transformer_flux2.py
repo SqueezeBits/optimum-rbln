@@ -18,7 +18,16 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
-from diffusers.models.transformers.transformer_flux2 import Flux2PosEmbed, Flux2Transformer2DModel
+from diffusers.models.transformers.transformer_flux2 import (
+    Flux2Attention,
+    Flux2AttnProcessor,
+    Flux2ParallelSelfAttention,
+    Flux2ParallelSelfAttnProcessor,
+    Flux2PosEmbed,
+    Flux2Transformer2DModel,
+    _get_qkv_projections,
+    dispatch_attention_fn,
+)
 from transformers import PretrainedConfig
 
 from ....configuration_utils import RBLNCompileConfig, RBLNModelConfig
@@ -98,9 +107,8 @@ class RBLNFlux2PosEmbed(nn.Module):
         cos_out = []
         sin_out = []
         pos = ids.float()
-        is_mps = ids.device.type == "mps"
-        is_npu = ids.device.type == "npu"
-        freqs_dtype = torch.float32 if (is_mps or is_npu) else torch.float64
+        # RBLN graph conversion fails on this rotary path when the intermediate frequency tensor is float64.
+        freqs_dtype = torch.float32
 
         for i in range(len(self.axes_dim)):
             cos, sin = self._get_1d_rotary_pos_embed(
@@ -115,6 +123,133 @@ class RBLNFlux2PosEmbed(nn.Module):
         freqs_cos = torch.cat(cos_out, dim=-1).to(ids.device)
         freqs_sin = torch.cat(sin_out, dim=-1).to(ids.device)
         return freqs_cos, freqs_sin
+
+
+def rbln_apply_rotary_emb(x: torch.Tensor, freqs_cis: Tuple[torch.Tensor, torch.Tensor], sequence_dim: int = 1):
+    cos, sin = freqs_cis
+    if sequence_dim == 2:
+        cos = cos[None, None, :, :]
+        sin = sin[None, None, :, :]
+    elif sequence_dim == 1:
+        cos = cos[None, :, None, :]
+        sin = sin[None, :, None, :]
+    else:
+        raise ValueError(f"`sequence_dim={sequence_dim}` but should be 1 or 2.")
+
+    cos, sin = cos.to(x.device), sin.to(x.device)
+    cos_half = cos[..., ::2]
+    sin_half = sin[..., ::2]
+    x_even = x[..., ::2]
+    x_odd = x[..., 1::2]
+    out_even = x_even * cos_half - x_odd * sin_half
+    out_odd = x_odd * cos_half + x_even * sin_half
+    return torch.stack([out_even, out_odd], dim=-1).flatten(3).to(x.dtype)
+
+
+class RBLNFlux2AttnProcessor(Flux2AttnProcessor):
+    def __call__(
+        self,
+        attn: "Flux2Attention",
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor = None,
+        attention_mask: torch.Tensor | None = None,
+        image_rotary_emb: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        query, key, value, encoder_query, encoder_key, encoder_value = _get_qkv_projections(
+            attn, hidden_states, encoder_hidden_states
+        )
+
+        query = query.unflatten(-1, (attn.heads, -1))
+        key = key.unflatten(-1, (attn.heads, -1))
+        value = value.unflatten(-1, (attn.heads, -1))
+
+        query = attn.norm_q(query)
+        key = attn.norm_k(key)
+
+        if attn.added_kv_proj_dim is not None:
+            encoder_query = encoder_query.unflatten(-1, (attn.heads, -1))
+            encoder_key = encoder_key.unflatten(-1, (attn.heads, -1))
+            encoder_value = encoder_value.unflatten(-1, (attn.heads, -1))
+
+            encoder_query = attn.norm_added_q(encoder_query)
+            encoder_key = attn.norm_added_k(encoder_key)
+
+            query = torch.cat([encoder_query, query], dim=1)
+            key = torch.cat([encoder_key, key], dim=1)
+            value = torch.cat([encoder_value, value], dim=1)
+
+        if image_rotary_emb is not None:
+            query = rbln_apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
+            key = rbln_apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+
+        hidden_states = dispatch_attention_fn(
+            query,
+            key,
+            value,
+            attn_mask=attention_mask,
+            backend=self._attention_backend,
+            parallel_config=self._parallel_config,
+        )
+        hidden_states = hidden_states.flatten(2, 3)
+        hidden_states = hidden_states.to(query.dtype)
+
+        if encoder_hidden_states is not None:
+            encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
+                [encoder_hidden_states.shape[1], hidden_states.shape[1] - encoder_hidden_states.shape[1]], dim=1
+            )
+            encoder_hidden_states = attn.to_add_out(encoder_hidden_states)
+
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
+
+        if encoder_hidden_states is not None:
+            return hidden_states, encoder_hidden_states
+        else:
+            return hidden_states
+
+
+class RBLNFlux2ParallelSelfAttnProcessor(Flux2ParallelSelfAttnProcessor):
+    def __call__(
+        self,
+        attn: "Flux2ParallelSelfAttention",
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        image_rotary_emb: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        hidden_states = attn.to_qkv_mlp_proj(hidden_states)
+        qkv, mlp_hidden_states = torch.split(
+            hidden_states, [3 * attn.inner_dim, attn.mlp_hidden_dim * attn.mlp_mult_factor], dim=-1
+        )
+
+        query, key, value = qkv.chunk(3, dim=-1)
+
+        query = query.unflatten(-1, (attn.heads, -1))
+        key = key.unflatten(-1, (attn.heads, -1))
+        value = value.unflatten(-1, (attn.heads, -1))
+
+        query = attn.norm_q(query)
+        key = attn.norm_k(key)
+
+        if image_rotary_emb is not None:
+            query = rbln_apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
+            key = rbln_apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+
+        hidden_states = dispatch_attention_fn(
+            query,
+            key,
+            value,
+            attn_mask=attention_mask,
+            backend=self._attention_backend,
+            parallel_config=self._parallel_config,
+        )
+        hidden_states = hidden_states.flatten(2, 3)
+        hidden_states = hidden_states.to(query.dtype)
+
+        mlp_hidden_states = attn.mlp_act_fn(mlp_hidden_states)
+        hidden_states = torch.cat([hidden_states, mlp_hidden_states], dim=-1)
+        hidden_states = attn.to_out(hidden_states)
+
+        return hidden_states
 
 
 class RBLNFlux2Transformer2DModel(RBLNModel):
@@ -137,6 +272,12 @@ class RBLNFlux2Transformer2DModel(RBLNModel):
             if isinstance(child, Flux2PosEmbed):
                 setattr(module, name, RBLNFlux2PosEmbed(theta=child.theta, axes_dim=child.axes_dim))
                 continue
+
+            if isinstance(child, Flux2Attention):
+                child.set_processor(RBLNFlux2AttnProcessor())
+
+            if isinstance(child, Flux2ParallelSelfAttention):
+                child.set_processor(RBLNFlux2ParallelSelfAttnProcessor())
 
             if isinstance(child, nn.RMSNorm):
                 replacement = RBLNFlux2RMSNorm(
@@ -231,6 +372,10 @@ class RBLNFlux2Transformer2DModel(RBLNModel):
                 f"Mismatch between transformer's runtime batch size ({sample_batch_size}) and "
                 f"compiled batch size ({self.compiled_batch_size}). Adjust the transformer batch size during compilation."
             )
+
+        hidden_states = hidden_states.contiguous()
+        if encoder_hidden_states is not None:
+            encoder_hidden_states = encoder_hidden_states.contiguous()
 
         forward_args = [hidden_states, encoder_hidden_states, timestep, img_ids, txt_ids]
         if len(self.rbln_config.compile_cfgs[0].input_info) == 6:
