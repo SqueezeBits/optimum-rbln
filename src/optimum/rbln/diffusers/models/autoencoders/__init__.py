@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from .autoencoder_kl import RBLNAutoencoderKL
+from .autoencoder_kl_flux2 import RBLNAutoencoderKLFlux2
 from .autoencoder_kl_cosmos import RBLNAutoencoderKLCosmos
 from .autoencoder_kl_temporal_decoder import RBLNAutoencoderKLTemporalDecoder
 from .vq_model import RBLNVQModel
