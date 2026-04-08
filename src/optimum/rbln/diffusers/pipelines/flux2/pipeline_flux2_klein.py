@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from diffusers import Flux2KleinPipeline
+import os
 
 from ....utils.logging import get_logger
 from ...configurations import RBLNFlux2KleinPipelineConfig
@@ -25,7 +26,10 @@ logger = get_logger(__name__)
 class RBLNFlux2KleinPipeline(RBLNDiffusionMixin, Flux2KleinPipeline):
     original_class = Flux2KleinPipeline
     _rbln_config_class = RBLNFlux2KleinPipelineConfig
-    _submodules = ["text_encoder", "vae"]
+    _submodules = ["text_encoder", "transformer", "vae"]
+    use_diffusers_transformer = os.getenv("USE_DIFFUSERS_TRANSFORMER", "0") == "1"
+    if use_diffusers_transformer:
+        _submodules = ["text_encoder", "vae"]
 
     def handle_additional_kwargs(self, **kwargs):
         if "max_sequence_length" in kwargs and kwargs["max_sequence_length"] != self.text_encoder.rbln_config.max_seq_len:

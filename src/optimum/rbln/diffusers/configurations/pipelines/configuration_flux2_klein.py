@@ -2,15 +2,16 @@ from typing import Any, Optional, Tuple
 
 from ....configuration_utils import RBLNModelConfig
 from ....transformers import RBLNQwen3ForCausalLMConfig
-from ..models import RBLNAutoencoderKLFlux2Config
+from ..models import RBLNAutoencoderKLFlux2Config, RBLNFlux2Transformer2DModelConfig
 
 
 class RBLNFlux2KleinPipelineConfig(RBLNModelConfig):
-    submodules = ["text_encoder", "vae"]
+    submodules = ["text_encoder", "transformer", "vae"]
 
     def __init__(
         self,
         text_encoder: Optional[RBLNQwen3ForCausalLMConfig] = None,
+        transformer: Optional[RBLNFlux2Transformer2DModelConfig] = None,
         vae: Optional[RBLNAutoencoderKLFlux2Config] = None,
         *,
         batch_size: Optional[int] = None,
@@ -49,6 +50,13 @@ class RBLNFlux2KleinPipelineConfig(RBLNModelConfig):
             use_attention_mask=True,
             output_hidden_states=True,
             phases=["prefill"],
+        )
+        self.transformer = self.initialize_submodule_config(
+            transformer,
+            cls_name="RBLNFlux2Transformer2DModelConfig",
+            batch_size=batch_size,
+            image_size=image_size,
+            max_seq_len=max_seq_len,
         )
         self.vae = self.initialize_submodule_config(
             vae,

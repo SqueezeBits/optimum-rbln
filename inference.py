@@ -20,6 +20,12 @@ def parsing_argument():
         default=42,
         help="(int) random seed for reproducibility",
     )
+    parser.add_argument(
+        "--use-diffusers-transformer",
+        action="store_true",
+        default=False,
+        help="flag to use diffusers transformer",
+    )
     return parser.parse_args()
 
 
@@ -27,11 +33,20 @@ def main():
     args = parsing_argument()
     model_id = "black-forest-labs/FLUX.2-klein-4B"
     prompt = args.prompt
+    rbln_config = {
+        "text_encoder": {"device": 0},
+        "vae": {"device": 0},
+    }
+
+    if args.use_diffusers_transformer:
+        os.environ["USE_DIFFUSERS_TRANSFORMER"] = "1"
+        rbln_config["transformer"] = {"device": 1}
 
     # Load compiled model
     pipe = RBLNAutoPipelineForText2Image.from_pretrained(
         model_id=os.path.basename(model_id),
         export=False,
+        rbln_config=rbln_config,
     )
 
     # Generate image

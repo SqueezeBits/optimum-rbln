@@ -1,9 +1,22 @@
+import argparse
 import os
 
 from optimum.rbln import RBLNAutoPipelineForText2Image
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--use-diffusers-transformer",
+        action="store_true",
+        default=False,
+        help="flag to use diffusers transformer",
+    )
+    args = parser.parse_args()
+
+    if args.use_diffusers_transformer:
+        os.environ["USE_DIFFUSERS_TRANSFORMER"] = "1"
+
     model_id = "black-forest-labs/FLUX.2-klein-4B"
 
     # Compile and export

@@ -242,6 +242,8 @@ _import_structure = {
         "RBLNCosmosSafetyChecker",
         "RBLNCosmosTransformer3DModel",
         "RBLNCosmosTransformer3DModelConfig",
+        "RBLNFlux2Transformer2DModel",
+        "RBLNFlux2Transformer2DModelConfig",
         "RBLNFlux2KleinPipeline",
         "RBLNFlux2KleinPipelineConfig",
         "RBLNDiffusionMixin",

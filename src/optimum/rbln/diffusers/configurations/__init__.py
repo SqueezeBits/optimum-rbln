@@ -5,6 +5,7 @@ from .models import (
     RBLNAutoencoderKLTemporalDecoderConfig,
     RBLNControlNetModelConfig,
     RBLNCosmosTransformer3DModelConfig,
+    RBLNFlux2Transformer2DModelConfig,
     RBLNPriorTransformerConfig,
     RBLNSD3Transformer2DModelConfig,
     RBLNUNet2DConditionModelConfig,
