@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Union
 
@@ -137,13 +138,38 @@ def rbln_apply_rotary_emb(x: torch.Tensor, freqs_cis: Tuple[torch.Tensor, torch.
         raise ValueError(f"`sequence_dim={sequence_dim}` but should be 1 or 2.")
 
     cos, sin = cos.to(x.device), sin.to(x.device)
-    cos_half = cos[..., ::2]
-    sin_half = sin[..., ::2]
-    x_even = x[..., ::2]
-    x_odd = x[..., 1::2]
-    out_even = x_even * cos_half - x_odd * sin_half
-    out_odd = x_odd * cos_half + x_even * sin_half
-    return torch.stack([out_even, out_odd], dim=-1).flatten(3).to(x.dtype)
+    rotary_impl = os.getenv("RBLN_FLUX2_DEBUG_ROTARY_IMPL", "interleaved_even_odd")
+
+    if rotary_impl == "interleaved_even_odd":
+        cos_half = cos[..., ::2]
+        sin_half = sin[..., ::2]
+        x_even = x[..., ::2]
+        x_odd = x[..., 1::2]
+        out_even = x_even * cos_half - x_odd * sin_half
+        out_odd = x_odd * cos_half + x_even * sin_half
+        return torch.stack([out_even, out_odd], dim=-1).flatten(3).to(x.dtype)
+
+    if rotary_impl == "contiguous_half":
+        x_first = x[..., : x.shape[-1] // 2]
+        x_second = x[..., x.shape[-1] // 2 :]
+        x_rotated = torch.cat([-x_second, x_first], dim=-1)
+        return (x.float() * cos + x_rotated.float() * sin).to(x.dtype)
+
+    raise ValueError(
+        "RBLN_FLUX2_DEBUG_ROTARY_IMPL must be one of "
+        "'interleaved_even_odd' or 'contiguous_half', "
+        f"got {rotary_impl!r}"
+    )
+
+
+def _get_rotary_tensor_layout() -> str:
+    layout = os.getenv("RBLN_FLUX2_DEBUG_ROTARY_LAYOUT", "bshd")
+    if layout not in {"bshd", "bhsd"}:
+        raise ValueError(
+            "RBLN_FLUX2_DEBUG_ROTARY_LAYOUT must be one of 'bshd' or 'bhsd', "
+            f"got {layout!r}"
+        )
+    return layout
 
 
 class RBLNFlux2AttnProcessor(Flux2AttnProcessor):
@@ -178,18 +204,38 @@ class RBLNFlux2AttnProcessor(Flux2AttnProcessor):
             key = torch.cat([encoder_key, key], dim=1)
             value = torch.cat([encoder_value, value], dim=1)
 
-        if image_rotary_emb is not None:
-            query = rbln_apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
-            key = rbln_apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+        rotary_layout = _get_rotary_tensor_layout()
+        if rotary_layout == "bhsd":
+            query = query.permute(0, 2, 1, 3)
+            key = key.permute(0, 2, 1, 3)
+            value = value.permute(0, 2, 1, 3)
 
-        hidden_states = dispatch_attention_fn(
-            query,
-            key,
-            value,
-            attn_mask=attention_mask,
-            backend=self._attention_backend,
-            parallel_config=self._parallel_config,
-        )
+            if image_rotary_emb is not None:
+                query = rbln_apply_rotary_emb(query, image_rotary_emb, sequence_dim=2)
+                key = rbln_apply_rotary_emb(key, image_rotary_emb, sequence_dim=2)
+
+            hidden_states = dispatch_attention_fn(
+                query,
+                key,
+                value,
+                attn_mask=attention_mask,
+                backend=self._attention_backend,
+                parallel_config=self._parallel_config,
+            )
+            hidden_states = hidden_states.permute(0, 2, 1, 3)
+        else:
+            if image_rotary_emb is not None:
+                query = rbln_apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
+                key = rbln_apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+
+            hidden_states = dispatch_attention_fn(
+                query,
+                key,
+                value,
+                attn_mask=attention_mask,
+                backend=self._attention_backend,
+                parallel_config=self._parallel_config,
+            )
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
 
@@ -230,18 +276,38 @@ class RBLNFlux2ParallelSelfAttnProcessor(Flux2ParallelSelfAttnProcessor):
         query = attn.norm_q(query)
         key = attn.norm_k(key)
 
-        if image_rotary_emb is not None:
-            query = rbln_apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
-            key = rbln_apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+        rotary_layout = _get_rotary_tensor_layout()
+        if rotary_layout == "bhsd":
+            query = query.permute(0, 2, 1, 3)
+            key = key.permute(0, 2, 1, 3)
+            value = value.permute(0, 2, 1, 3)
 
-        hidden_states = dispatch_attention_fn(
-            query,
-            key,
-            value,
-            attn_mask=attention_mask,
-            backend=self._attention_backend,
-            parallel_config=self._parallel_config,
-        )
+            if image_rotary_emb is not None:
+                query = rbln_apply_rotary_emb(query, image_rotary_emb, sequence_dim=2)
+                key = rbln_apply_rotary_emb(key, image_rotary_emb, sequence_dim=2)
+
+            hidden_states = dispatch_attention_fn(
+                query,
+                key,
+                value,
+                attn_mask=attention_mask,
+                backend=self._attention_backend,
+                parallel_config=self._parallel_config,
+            )
+            hidden_states = hidden_states.permute(0, 2, 1, 3)
+        else:
+            if image_rotary_emb is not None:
+                query = rbln_apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
+                key = rbln_apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+
+            hidden_states = dispatch_attention_fn(
+                query,
+                key,
+                value,
+                attn_mask=attention_mask,
+                backend=self._attention_backend,
+                parallel_config=self._parallel_config,
+            )
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
 

@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import time
 
@@ -50,6 +51,7 @@ def main():
         export=False,
         rbln_config=rbln_config,
     )
+    # pipe.transformer.model[0].flush_reports()
 
     # Generate image
     torch.manual_seed(args.seed)
@@ -58,6 +60,8 @@ def main():
     image = pipe(prompt=prompt, num_inference_steps=4, guidance_scale=1.0, generator=generator, height=1024, width=1024).images[0]
     end_time = time.perf_counter()
     print(f"Time taken: {end_time - start_time} seconds")
+    # report = pipe.transformer.model[0].get_reports()
+    # json.dump(report, open("flux_transformer_report.json", "w"), indent=4)
 
     # Save image result
     image.save(f"output.png")
