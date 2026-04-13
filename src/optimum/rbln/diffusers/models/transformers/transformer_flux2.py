@@ -52,21 +52,53 @@ class Flux2Transformer2DModelWrapper(torch.nn.Module):
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor = None,
         timestep: torch.LongTensor = None,
-        img_ids: torch.Tensor = None,
-        txt_ids: torch.Tensor = None,
+        image_rotary_emb_0: torch.Tensor = None,
+        image_rotary_emb_1: torch.Tensor = None,
         guidance: torch.Tensor = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         return_dict: bool = True,
     ):
-        return self.model(
-            hidden_states=hidden_states,
-            encoder_hidden_states=encoder_hidden_states,
-            timestep=timestep,
-            img_ids=img_ids,
-            txt_ids=txt_ids,
-            guidance=guidance,
-            return_dict=False,
-        )
+        num_txt_tokens = encoder_hidden_states.shape[1]
+        timestep = timestep.to(hidden_states.dtype) * 1000
+
+        if guidance is not None:
+            guidance = guidance.to(hidden_states.dtype) * 1000
+
+        temb = self.model.time_guidance_embed(timestep, guidance)
+        double_stream_mod_img = self.model.double_stream_modulation_img(temb)
+        double_stream_mod_txt = self.model.double_stream_modulation_txt(temb)
+        single_stream_mod = self.model.single_stream_modulation(temb)
+
+        hidden_states = self.model.x_embedder(hidden_states)
+        encoder_hidden_states = self.model.context_embedder(encoder_hidden_states)
+
+        concat_rotary_emb = (image_rotary_emb_0, image_rotary_emb_1)
+
+        for block in self.model.transformer_blocks:
+            encoder_hidden_states, hidden_states = block(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                temb_mod_img=double_stream_mod_img,
+                temb_mod_txt=double_stream_mod_txt,
+                image_rotary_emb=concat_rotary_emb,
+                joint_attention_kwargs=joint_attention_kwargs,
+            )
+
+        hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+
+        for block in self.model.single_transformer_blocks:
+            hidden_states = block(
+                hidden_states=hidden_states,
+                encoder_hidden_states=None,
+                temb_mod=single_stream_mod,
+                image_rotary_emb=concat_rotary_emb,
+                joint_attention_kwargs=joint_attention_kwargs,
+            )
+
+        hidden_states = hidden_states[:, num_txt_tokens:, ...]
+        hidden_states = self.model.norm_out(hidden_states, temb)
+        hidden_states = self.model.proj_out(hidden_states)
+        return (hidden_states,)
 
 
 # aten::rms_norm is not supported.
@@ -323,6 +355,10 @@ class RBLNFlux2Transformer2DModel(RBLNModel):
     auto_model_class = Flux2Transformer2DModel
     _output_class = Transformer2DModelOutput
 
+    def __post_init__(self, **kwargs):
+        super().__post_init__(**kwargs)
+        self.pos_embed = RBLNFlux2PosEmbed(theta=self.config.rope_theta, axes_dim=self.config.axes_dims_rope)
+
     @classmethod
     def _wrap_model_if_needed(cls, model: torch.nn.Module, rbln_config: RBLNModelConfig) -> torch.nn.Module:
         return Flux2Transformer2DModelWrapper(model).eval()
@@ -388,6 +424,7 @@ class RBLNFlux2Transformer2DModel(RBLNModel):
             image_size = rbln_config.image_size
 
         image_token_length = (image_size[0] // 16) * (image_size[1] // 16)
+        rotary_dim = sum(model_config.axes_dims_rope)
 
         input_info = [
             (
@@ -401,8 +438,8 @@ class RBLNFlux2Transformer2DModel(RBLNModel):
                 "float32",
             ),
             ("timestep", [rbln_config.batch_size], "float32"),
-            ("img_ids", [rbln_config.batch_size, image_token_length, 4], "int64"),
-            ("txt_ids", [rbln_config.batch_size, rbln_config.max_seq_len, 4], "int64"),
+            ("image_rotary_emb_0", [rbln_config.max_seq_len + image_token_length, rotary_dim], "float32"),
+            ("image_rotary_emb_1", [rbln_config.max_seq_len + image_token_length, rotary_dim], "float32"),
         ]
 
         if getattr(model_config, "guidance_embeds", False):
@@ -415,6 +452,19 @@ class RBLNFlux2Transformer2DModel(RBLNModel):
     @property
     def compiled_batch_size(self):
         return self.rbln_config.compile_cfgs[0].input_info[0][1][0]
+
+    def compute_embedding(self, img_ids: torch.Tensor, txt_ids: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if img_ids.ndim == 3:
+            img_ids = img_ids[0]
+        if txt_ids.ndim == 3:
+            txt_ids = txt_ids[0]
+
+        image_rotary_emb = self.pos_embed(img_ids)
+        text_rotary_emb = self.pos_embed(txt_ids)
+        return (
+            torch.cat([text_rotary_emb[0], image_rotary_emb[0]], dim=0),
+            torch.cat([text_rotary_emb[1], image_rotary_emb[1]], dim=0),
+        )
 
     @contextmanager
     def cache_context(self, name: str):
@@ -443,7 +493,11 @@ class RBLNFlux2Transformer2DModel(RBLNModel):
         if encoder_hidden_states is not None:
             encoder_hidden_states = encoder_hidden_states.contiguous()
 
-        forward_args = [hidden_states, encoder_hidden_states, timestep, img_ids, txt_ids]
+        image_rotary_emb_0, image_rotary_emb_1 = self.compute_embedding(img_ids, txt_ids)
+        image_rotary_emb_0 = image_rotary_emb_0.contiguous()
+        image_rotary_emb_1 = image_rotary_emb_1.contiguous()
+
+        forward_args = [hidden_states, encoder_hidden_states, timestep, image_rotary_emb_0, image_rotary_emb_1]
         if len(self.rbln_config.compile_cfgs[0].input_info) == 6:
             forward_args.append(guidance)
 
