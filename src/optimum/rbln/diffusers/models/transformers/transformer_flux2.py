@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+from diffusers.models.attention import AttentionModuleMixin
 from diffusers.models.attention_dispatch import dispatch_attention_fn
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.transformers.transformer_flux2 import (
@@ -208,7 +209,7 @@ class RBLNFlux2AttnProcessor(Flux2AttnProcessor):
 class RBLNFlux2ParallelSelfAttnProcessor(Flux2ParallelSelfAttnProcessor):
     def __call__(
         self,
-        attn: "Flux2ParallelSelfAttention",
+        attn: "RBLNFlux2ParallelSelfAttention",
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         image_rotary_emb: torch.Tensor | None = None,
@@ -244,10 +245,58 @@ class RBLNFlux2ParallelSelfAttnProcessor(Flux2ParallelSelfAttnProcessor):
 
         mlp_hidden_states = attn.mlp_act_fn(mlp_hidden_states)
 
-        hidden_states = torch.cat([hidden_states, mlp_hidden_states], dim=-1)
-        hidden_states = attn.to_out(hidden_states)
+        hidden_states = attn.to_out_0(hidden_states)
+        mlp_hidden_states = attn.to_out_1(mlp_hidden_states)
 
-        return hidden_states
+        return hidden_states + mlp_hidden_states
+
+
+class RBLNFlux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
+    _default_processor_cls = RBLNFlux2ParallelSelfAttnProcessor
+    _available_processors = [RBLNFlux2ParallelSelfAttnProcessor]
+    _supports_qkv_fusion = False
+
+    def __init__(self, org: Flux2ParallelSelfAttention):
+        super().__init__()
+
+        self.head_dim = org.head_dim
+        self.inner_dim = org.inner_dim
+        self.query_dim = org.query_dim
+        self.out_dim = org.out_dim
+        self.heads = org.heads
+
+        self.use_bias = org.use_bias
+        self.dropout = org.dropout
+
+        self.mlp_ratio = org.mlp_ratio
+        self.mlp_hidden_dim = org.mlp_hidden_dim
+        self.mlp_mult_factor = org.mlp_mult_factor
+
+        self.set_processor(RBLNFlux2ParallelSelfAttnProcessor()) # type: ignore
+        
+        self.to_qkv_mlp_proj = org.to_qkv_mlp_proj
+        self.norm_q = org.norm_q 
+        self.norm_k = org.norm_k 
+        self.mlp_act_fn = org.mlp_act_fn
+        
+        with torch.no_grad():
+            out_weight = org.to_out.weight # [self.out_dim, self.inner_dim + self.mlp_hidden_dim]
+            out_bias = org.to_out.bias # [self.out_dim]
+            self.to_out_0 = torch.nn.Linear(self.inner_dim, self.out_dim, bias=out_bias is not None)
+            self.to_out_1 = torch.nn.Linear(self.mlp_hidden_dim, self.out_dim, bias=False)
+            self.to_out_0.weight.copy_(out_weight[:,:self.inner_dim])
+            self.to_out_1.weight.copy_(out_weight[:,self.inner_dim:])
+            if out_bias:
+                self.to_out_0.bias.copy_(out_bias)   
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        image_rotary_emb: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        return self.processor(self, hidden_states, attention_mask, image_rotary_emb)
 
 
 class RBLNFlux2Transformer2DModel(RBLNModel):
@@ -275,7 +324,8 @@ class RBLNFlux2Transformer2DModel(RBLNModel):
                 child.set_processor(RBLNFlux2AttnProcessor())
 
             if isinstance(child, Flux2ParallelSelfAttention):
-                child.set_processor(RBLNFlux2ParallelSelfAttnProcessor())
+                child = RBLNFlux2ParallelSelfAttention(child)
+                setattr(module, name, child)
 
             if isinstance(child, nn.RMSNorm):
                 replacement = RBLNFlux2RMSNorm(

@@ -25,6 +25,8 @@ def main():
         rbln_width=1024,
     )
 
+    print(pipe.transformer)
+
     # Save compiled results to disk
     pipe.save_pretrained(os.path.basename(model_id))
 
