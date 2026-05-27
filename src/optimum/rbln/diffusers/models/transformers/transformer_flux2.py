@@ -158,6 +158,22 @@ class RBLNFlux2PosEmbed(nn.Module):
         return freqs_cos, freqs_sin
 
 
+def _select_interleaved_rotary_halves(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    half_dim = x.shape[-1] // 2
+    if cos.shape[-1] == half_dim and sin.shape[-1] == half_dim:
+        return cos, sin
+    if cos.shape[-1] == x.shape[-1] and sin.shape[-1] == x.shape[-1]:
+        return cos[..., ::2], sin[..., ::2]
+    raise ValueError(
+        "Interleaved FLUX.2 RoPE expects full-width or half-width rotary tables: "
+        f"x_last_dim={x.shape[-1]}, cos_last_dim={cos.shape[-1]}, sin_last_dim={sin.shape[-1]}"
+    )
+
+
 def rbln_apply_rotary_emb(x: torch.Tensor, freqs_cis: Tuple[torch.Tensor, torch.Tensor], sequence_dim: int = 1):
     cos, sin = freqs_cis
     if sequence_dim == 2:
@@ -173,13 +189,15 @@ def rbln_apply_rotary_emb(x: torch.Tensor, freqs_cis: Tuple[torch.Tensor, torch.
     rotary_impl = os.getenv("RBLN_FLUX2_DEBUG_ROTARY_IMPL", "interleaved_even_odd")
 
     if rotary_impl == "interleaved_even_odd":
-        cos_half = cos[..., ::2]
-        sin_half = sin[..., ::2]
+        cos_half, sin_half = _select_interleaved_rotary_halves(x, cos, sin)
         x_even = x[..., ::2]
         x_odd = x[..., 1::2]
         out_even = x_even * cos_half - x_odd * sin_half
         out_odd = x_odd * cos_half + x_even * sin_half
-        return torch.stack([out_even, out_odd], dim=-1).flatten(3).to(x.dtype)
+        output = torch.empty_like(x)
+        output = torch.slice_scatter(output, out_even, dim=-1, start=0, end=x.shape[-1], step=2)
+        output = torch.slice_scatter(output, out_odd, dim=-1, start=1, end=x.shape[-1], step=2)
+        return output.to(x.dtype)
 
     if rotary_impl == "contiguous_half":
         x_first = x[..., : x.shape[-1] // 2]
@@ -195,13 +213,38 @@ def rbln_apply_rotary_emb(x: torch.Tensor, freqs_cis: Tuple[torch.Tensor, torch.
 
 
 def _get_rotary_tensor_layout() -> str:
-    layout = os.getenv("RBLN_FLUX2_DEBUG_ROTARY_LAYOUT", "bshd")
+    layout = os.getenv("RBLN_FLUX2_DEBUG_ROTARY_LAYOUT", "bhsd")
     if layout not in {"bshd", "bhsd"}:
         raise ValueError(
             "RBLN_FLUX2_DEBUG_ROTARY_LAYOUT must be one of 'bshd' or 'bhsd', "
             f"got {layout!r}"
         )
     return layout
+
+
+def _scaled_dot_product_attention_bhsd(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    attention_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if (
+        attention_mask is not None
+        and attention_mask.ndim == 2
+        and attention_mask.shape[0] == query.shape[0]
+        and attention_mask.shape[1] == key.shape[2]
+    ):
+        attention_mask = attention_mask.unsqueeze(1).unsqueeze(1)
+
+    return torch.nn.functional.scaled_dot_product_attention(
+        query=query,
+        key=key,
+        value=value,
+        attn_mask=attention_mask,
+        dropout_p=0.0,
+        is_causal=False,
+    )
 
 
 class RBLNFlux2AttnProcessor(Flux2AttnProcessor):
@@ -246,13 +289,11 @@ class RBLNFlux2AttnProcessor(Flux2AttnProcessor):
                 query = rbln_apply_rotary_emb(query, image_rotary_emb, sequence_dim=2)
                 key = rbln_apply_rotary_emb(key, image_rotary_emb, sequence_dim=2)
 
-            hidden_states = dispatch_attention_fn(
+            hidden_states = _scaled_dot_product_attention_bhsd(
                 query,
                 key,
                 value,
-                attn_mask=attention_mask,
-                backend=self._attention_backend,
-                parallel_config=self._parallel_config,
+                attention_mask=attention_mask,
             )
             hidden_states = hidden_states.permute(0, 2, 1, 3)
         else:
@@ -294,10 +335,14 @@ class RBLNFlux2ParallelSelfAttnProcessor(Flux2ParallelSelfAttnProcessor):
         attention_mask: torch.Tensor | None = None,
         image_rotary_emb: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        hidden_states = attn.to_qkv_mlp_proj(hidden_states)
-        qkv, mlp_hidden_states = torch.split(
-            hidden_states, [3 * attn.inner_dim, attn.mlp_hidden_dim * attn.mlp_mult_factor], dim=-1
-        )
+        if getattr(attn, "_rbln_defused_parallel_self_attention", False):
+            qkv = attn.to_qkv_proj(hidden_states)
+            mlp_hidden_states = attn.to_mlp_in_proj(hidden_states)
+        else:
+            hidden_states = attn.to_qkv_mlp_proj(hidden_states)
+            qkv, mlp_hidden_states = torch.split(
+                hidden_states, [3 * attn.inner_dim, attn.mlp_hidden_dim * attn.mlp_mult_factor], dim=-1
+            )
 
         query, key, value = qkv.chunk(3, dim=-1)
 
@@ -318,13 +363,11 @@ class RBLNFlux2ParallelSelfAttnProcessor(Flux2ParallelSelfAttnProcessor):
                 query = rbln_apply_rotary_emb(query, image_rotary_emb, sequence_dim=2)
                 key = rbln_apply_rotary_emb(key, image_rotary_emb, sequence_dim=2)
 
-            hidden_states = dispatch_attention_fn(
+            hidden_states = _scaled_dot_product_attention_bhsd(
                 query,
                 key,
                 value,
-                attn_mask=attention_mask,
-                backend=self._attention_backend,
-                parallel_config=self._parallel_config,
+                attention_mask=attention_mask,
             )
             hidden_states = hidden_states.permute(0, 2, 1, 3)
         else:
@@ -344,10 +387,98 @@ class RBLNFlux2ParallelSelfAttnProcessor(Flux2ParallelSelfAttnProcessor):
         hidden_states = hidden_states.to(query.dtype)
 
         mlp_hidden_states = attn.mlp_act_fn(mlp_hidden_states)
-        hidden_states = torch.cat([hidden_states, mlp_hidden_states], dim=-1)
-        hidden_states = attn.to_out(hidden_states)
+        if getattr(attn, "_rbln_defused_parallel_self_attention", False):
+            hidden_states = attn.to_attn_out(hidden_states) + attn.to_mlp_out(
+                mlp_hidden_states
+            )
+        else:
+            hidden_states = torch.cat([hidden_states, mlp_hidden_states], dim=-1)
+            hidden_states = attn.to_out(hidden_states)
 
         return hidden_states
+
+
+def _linear_from_slices(
+    original: nn.Linear,
+    *,
+    out_slice: slice,
+    in_slice: slice,
+    bias_slice: slice | None,
+) -> nn.Linear:
+    weight = original.weight[out_slice, in_slice].contiguous()
+    replacement = nn.Linear(
+        weight.shape[1],
+        weight.shape[0],
+        bias=bias_slice is not None,
+        device=original.weight.device,
+        dtype=original.weight.dtype,
+    )
+    replacement.weight.requires_grad = original.weight.requires_grad
+    replacement.weight.data.copy_(weight)
+
+    if bias_slice is not None:
+        if original.bias is None:
+            raise ValueError("Cannot copy a bias slice from a bias-less Linear")
+        bias = original.bias[bias_slice].contiguous()
+        replacement.bias.requires_grad = original.bias.requires_grad
+        replacement.bias.data.copy_(bias)
+
+    return replacement
+
+
+def _defuse_flux2_parallel_self_attention(attention: Flux2ParallelSelfAttention) -> bool:
+    if getattr(attention, "_rbln_defused_parallel_self_attention", False):
+        return False
+
+    qkv_mlp = getattr(attention, "to_qkv_mlp_proj", None)
+    fused_out = getattr(attention, "to_out", None)
+    if not isinstance(qkv_mlp, nn.Linear) or not isinstance(fused_out, nn.Linear):
+        return False
+
+    qkv_out_features = 3 * attention.inner_dim
+    mlp_out_features = attention.mlp_hidden_dim * attention.mlp_mult_factor
+    fused_in_features = attention.inner_dim + attention.mlp_hidden_dim
+    if qkv_mlp.out_features != qkv_out_features + mlp_out_features:
+        raise ValueError(
+            "Unexpected Flux2 single-stream fused input projection shape: "
+            f"out_features={qkv_mlp.out_features}, expected={qkv_out_features + mlp_out_features}"
+        )
+    if fused_out.in_features != fused_in_features:
+        raise ValueError(
+            "Unexpected Flux2 single-stream fused output projection shape: "
+            f"in_features={fused_out.in_features}, expected={fused_in_features}"
+        )
+
+    attention.to_qkv_proj = _linear_from_slices(
+        qkv_mlp,
+        out_slice=slice(0, qkv_out_features),
+        in_slice=slice(None),
+        bias_slice=slice(0, qkv_out_features) if qkv_mlp.bias is not None else None,
+    )
+    attention.to_mlp_in_proj = _linear_from_slices(
+        qkv_mlp,
+        out_slice=slice(qkv_out_features, qkv_out_features + mlp_out_features),
+        in_slice=slice(None),
+        bias_slice=slice(qkv_out_features, qkv_out_features + mlp_out_features)
+        if qkv_mlp.bias is not None
+        else None,
+    )
+    attention.to_attn_out = _linear_from_slices(
+        fused_out,
+        out_slice=slice(None),
+        in_slice=slice(0, attention.inner_dim),
+        bias_slice=slice(None) if fused_out.bias is not None else None,
+    )
+    attention.to_mlp_out = _linear_from_slices(
+        fused_out,
+        out_slice=slice(None),
+        in_slice=slice(attention.inner_dim, fused_in_features),
+        bias_slice=None,
+    )
+    attention.to_qkv_mlp_proj = nn.Identity()
+    attention.to_out = nn.Identity()
+    attention._rbln_defused_parallel_self_attention = True
+    return True
 
 
 class RBLNFlux2Transformer2DModel(RBLNModel):
@@ -379,6 +510,7 @@ class RBLNFlux2Transformer2DModel(RBLNModel):
                 child.set_processor(RBLNFlux2AttnProcessor())
 
             if isinstance(child, Flux2ParallelSelfAttention):
+                _defuse_flux2_parallel_self_attention(child)
                 child.set_processor(RBLNFlux2ParallelSelfAttnProcessor())
 
             if isinstance(child, nn.RMSNorm):
