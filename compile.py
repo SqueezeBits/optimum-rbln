@@ -1,30 +1,19 @@
-import argparse
 import os
 
 from optimum.rbln import RBLNAutoPipelineForText2Image
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--use-diffusers-transformer",
-        action="store_true",
-        default=False,
-        help="flag to use diffusers transformer",
-    )
-    args = parser.parse_args()
-
-    if args.use_diffusers_transformer:
-        os.environ["USE_DIFFUSERS_TRANSFORMER"] = "1"
-
     model_id = "black-forest-labs/FLUX.2-klein-4B"
     rbln_config = {
         "text_encoder": {"device": 0},
         "vae": {"device": 0},
+        "transformer": (
+            {"device": [0, 1, 2, 3], "tensor_parallel_size": 4}
+            if os.environ.get("RSD", None) else 
+            {"device": 1, "tensor_parallel_size": 1} 
+        ),
     }
-
-    if not args.use_diffusers_transformer:
-        rbln_config["transformer"] = {"device": 1}
 
     # Compile and export
     pipe = RBLNAutoPipelineForText2Image.from_pretrained(
