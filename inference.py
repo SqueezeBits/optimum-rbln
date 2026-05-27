@@ -29,8 +29,8 @@ def main():
     model_id = "black-forest-labs/FLUX.2-klein-4B"
     prompt = args.prompt
     rbln_config = {
-        "text_encoder": {"device": 0},
-        "vae": {"device": 0},
+        "text_encoder": {"device": 3},
+        "vae": {"device": 3},
         "transformer": (
             {"device": [0, 1, 2, 3], "tensor_parallel_size": 4}
             if os.environ.get("RSD", None) else 

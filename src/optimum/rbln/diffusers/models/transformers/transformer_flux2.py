@@ -17,10 +17,16 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+from diffusers.models.attention_dispatch import dispatch_attention_fn
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.transformers.transformer_flux2 import (
+    Flux2Attention,
+    Flux2AttnProcessor,
+    Flux2ParallelSelfAttention,
+    Flux2ParallelSelfAttnProcessor,
     Flux2PosEmbed,
     Flux2Transformer2DModel,
+    _get_qkv_projections,
 )
 from transformers import PretrainedConfig
 
@@ -114,6 +120,136 @@ class RBLNFlux2RMSNorm(nn.Module):
         return hidden_states
 
 
+def rbln_apply_rotary_emb(x: torch.Tensor, freqs_cis: Tuple[torch.Tensor, torch.Tensor], sequence_dim: int = 1):
+    cos, sin = freqs_cis
+    if sequence_dim == 2:
+        cos = cos[None, None, :, :]
+        sin = sin[None, None, :, :]
+    elif sequence_dim == 1:
+        cos = cos[None, :, None, :]
+        sin = sin[None, :, None, :]
+    else:
+        raise ValueError(f"`sequence_dim={sequence_dim}` but should be 1 or 2.")
+
+    cos, sin = cos.to(x.device), sin.to(x.device)
+    cos_half, sin_half = cos[..., ::2], sin[..., ::2]
+    x_even = x[..., ::2]
+    x_odd = x[..., 1::2]
+    out_even = x_even * cos_half - x_odd * sin_half
+    out_odd = x_odd * cos_half + x_even * sin_half
+    output = torch.empty_like(x)
+    output = torch.slice_scatter(output, out_even, dim=-1, start=0, end=x.shape[-1], step=2)
+    output = torch.slice_scatter(output, out_odd, dim=-1, start=1, end=x.shape[-1], step=2)
+    return output.to(x.dtype)
+
+   
+class RBLNFlux2AttnProcessor(Flux2AttnProcessor):
+    def __call__(
+        self,
+        attn: "Flux2Attention",
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor = None,
+        attention_mask: torch.Tensor | None = None,
+        image_rotary_emb: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        query, key, value, encoder_query, encoder_key, encoder_value = _get_qkv_projections(
+            attn, hidden_states, encoder_hidden_states
+        )
+
+        query = query.unflatten(-1, (attn.heads, -1))
+        key = key.unflatten(-1, (attn.heads, -1))
+        value = value.unflatten(-1, (attn.heads, -1))
+
+        query = attn.norm_q(query)
+        key = attn.norm_k(key)
+
+        if attn.added_kv_proj_dim is not None:
+            encoder_query = encoder_query.unflatten(-1, (attn.heads, -1))
+            encoder_key = encoder_key.unflatten(-1, (attn.heads, -1))
+            encoder_value = encoder_value.unflatten(-1, (attn.heads, -1))
+
+            encoder_query = attn.norm_added_q(encoder_query)
+            encoder_key = attn.norm_added_k(encoder_key)
+
+            query = torch.cat([encoder_query, query], dim=1)
+            key = torch.cat([encoder_key, key], dim=1)
+            value = torch.cat([encoder_value, value], dim=1)
+
+        if image_rotary_emb is not None:
+            query = rbln_apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
+            key = rbln_apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+
+        hidden_states = dispatch_attention_fn(
+            query,
+            key,
+            value,
+            attn_mask=attention_mask,
+            backend=self._attention_backend,
+            parallel_config=self._parallel_config,
+        )
+        hidden_states = hidden_states.flatten(2, 3)
+        hidden_states = hidden_states.to(query.dtype)
+
+        if encoder_hidden_states is not None:
+            encoder_hidden_states, hidden_states = hidden_states.split_with_sizes(
+                [encoder_hidden_states.shape[1], hidden_states.shape[1] - encoder_hidden_states.shape[1]], dim=1
+            )
+            encoder_hidden_states = attn.to_add_out(encoder_hidden_states)
+
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
+
+        if encoder_hidden_states is not None:
+            return hidden_states, encoder_hidden_states
+        else:
+            return hidden_states
+
+
+class RBLNFlux2ParallelSelfAttnProcessor(Flux2ParallelSelfAttnProcessor):
+    def __call__(
+        self,
+        attn: "Flux2ParallelSelfAttention",
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        image_rotary_emb: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        hidden_states = attn.to_qkv_mlp_proj(hidden_states)
+        qkv, mlp_hidden_states = torch.split(
+            hidden_states, [3 * attn.inner_dim, attn.mlp_hidden_dim * attn.mlp_mult_factor], dim=-1
+        )
+
+        query, key, value = qkv.chunk(3, dim=-1)
+
+        query = query.unflatten(-1, (attn.heads, -1))
+        key = key.unflatten(-1, (attn.heads, -1))
+        value = value.unflatten(-1, (attn.heads, -1))
+
+        query = attn.norm_q(query)
+        key = attn.norm_k(key)
+
+        if image_rotary_emb is not None:
+            query = rbln_apply_rotary_emb(query, image_rotary_emb, sequence_dim=1)
+            key = rbln_apply_rotary_emb(key, image_rotary_emb, sequence_dim=1)
+
+        hidden_states = dispatch_attention_fn(
+            query,
+            key,
+            value,
+            attn_mask=attention_mask,
+            backend=self._attention_backend,
+            parallel_config=self._parallel_config,
+        )
+        hidden_states = hidden_states.flatten(2, 3)
+        hidden_states = hidden_states.to(query.dtype)
+
+        mlp_hidden_states = attn.mlp_act_fn(mlp_hidden_states)
+
+        hidden_states = torch.cat([hidden_states, mlp_hidden_states], dim=-1)
+        hidden_states = attn.to_out(hidden_states)
+
+        return hidden_states
+
+
 class RBLNFlux2Transformer2DModel(RBLNModel):
     hf_library_name = "diffusers"
     auto_model_class = Flux2Transformer2DModel
@@ -135,6 +271,12 @@ class RBLNFlux2Transformer2DModel(RBLNModel):
     @classmethod
     def _replace_unsupported_modules(cls, module: nn.Module):
         for name, child in list(module.named_children()):
+            if isinstance(child, Flux2Attention):
+                child.set_processor(RBLNFlux2AttnProcessor())
+
+            if isinstance(child, Flux2ParallelSelfAttention):
+                child.set_processor(RBLNFlux2ParallelSelfAttnProcessor())
+
             if isinstance(child, nn.RMSNorm):
                 replacement = RBLNFlux2RMSNorm(
                     hidden_size=child.normalized_shape[0],
