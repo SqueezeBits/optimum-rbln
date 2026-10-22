@@ -11,9 +11,15 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextRotaryEmbe
 from .....configuration_utils import RBLNCompileConfig
 from .....modeling import RBLNModel
 from .....modeling_base import Preprocessor
+from .....transformers import RBLNQwen3VLModel, RBLNQwen3VLVisionModel
 from .....utils.logging import get_logger
+from ....modeling_activation_utils import replace_gelu_tanh_for_npu, replace_silu_for_npu
 from ....utils import experimental
-from .configuration_qwen3_vl import RBLNQwen3VLTextEncoderConfig
+from .configuration_qwen3_vl import (
+    RBLNQwen3VLTextEncoderConfig,
+    RBLNQwenImage21TextEncoderConfig,
+    RBLNQwenImage21VisionModelConfig,
+)
 from .qwen3_vl_architecture import Qwen3VLTextEncoderWrapper
 
 
@@ -156,6 +162,55 @@ class RBLNQwen3VLTextEncoder(RBLNModel):
         return BaseModelOutputWithPast(hidden_states=hidden_states)
 
 
+class RBLNQwenImage21VisionModel(RBLNQwen3VLVisionModel):
+    """
+    The Qwen3-VL vision transformer of the Qwen-Image 2.1 prompt encoder: RBLNQwen3VLVisionModel with the block
+    activations rewritten for RBLN-CR13 (`exp_gelu`).
+    """
+
+    @classmethod
+    def _wrap_model_if_needed(cls, model: "PreTrainedModel", rbln_config: RBLNQwenImage21VisionModelConfig):
+        if rbln_config.exp_gelu:
+            for vision_block in model.blocks:
+                replace_gelu_tanh_for_npu(vision_block.mlp, rbln_config.npu)
+        return super()._wrap_model_if_needed(model, rbln_config)
+
+
+@experimental
+class RBLNQwenImage21TextEncoder(RBLNQwen3VLModel):
+    """
+    A Qwen3-VL model as the prompt encoder of Qwen-Image 2.1: RBLNQwen3VLModel compiled from the pipeline's
+    `Qwen3VLForConditionalGeneration`, with the MLP activations rewritten for RBLN-CR13 (`exp_silu`) and the last
+    layer's output returned before the final norm (`final_norm=False`), as the pipeline reads it.
+    """
+
+    _hf_class = Qwen3VLForConditionalGeneration
+    _rbln_submodules = [{"name": "visual", "config_class": RBLNQwenImage21VisionModelConfig}]
+
+    @classmethod
+    def update_rbln_config_using_pipe(cls, pipe: Any, rbln_config: Any, submodule_name: str) -> Any:
+        # As a pipeline's prompt encoder, the pipeline config sets everything.
+        return rbln_config
+
+    @classmethod
+    def _reconstruct_model_if_needed(cls, model: "PreTrainedModel"):
+        # A pipeline hands over the Qwen3VLForConditionalGeneration it loaded: compile its base model (no LM head).
+        return model.model if getattr(model, "lm_head", None) is not None else model
+
+    @classmethod
+    def _wrap_model_if_needed(cls, model: "PreTrainedModel", rbln_config: RBLNQwenImage21TextEncoderConfig):
+        # The decoder wrapper takes the layers' MLPs and the final norm as they are, so they are changed here first.
+        language_model = model.get_decoder()
+        if rbln_config.exp_silu:
+            for layer in language_model.layers:
+                replace_silu_for_npu(layer.mlp, rbln_config.npu)
+        if not rbln_config.final_norm:
+            language_model.norm = torch.nn.Identity()
+        return super()._wrap_model_if_needed(model, rbln_config)
+
+
 __all__ = [
     "RBLNQwen3VLTextEncoder",
+    "RBLNQwenImage21TextEncoder",
+    "RBLNQwenImage21VisionModel",
 ]
