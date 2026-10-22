@@ -24,6 +24,7 @@ from transformers.initialization import no_init_weights
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
     Qwen3_5Model,
+    Qwen3_5TextModel,
     Qwen3_5TextRotaryEmbedding,
     Qwen3_5VisionModel,
     Qwen3_5VisionPatchEmbed,
@@ -166,10 +167,38 @@ class RBLNQwen3_5TextModel(RBLNDecoderOnlyModel):
     `RBLNQwen3_5RuntimeModel`), `_get_compile_context` (mark conv/recurrent static) and `_update_rbln_config`
     (validate `layer_types`). `RBLNQwen3_5ForCausalLM` adds the LM head on top, mirroring how
     `RBLNDecoderOnlyModelForCausalLM` extends `RBLNDecoderOnlyModel`.
+
+    The model returns the final hidden state at every position, for example for a task head that runs on the host.
+    It loads the language model of a vision-language Qwen3.5 checkpoint as well.
+
+    Examples:
+        ```python
+        from transformers import AutoTokenizer
+
+        from optimum.rbln import RBLNQwen3_5TextModel
+
+        model = RBLNQwen3_5TextModel.from_pretrained(
+            "Qwen/Qwen3.5-0.8B",
+            export=True,
+            rbln_config={"num_devices": 1, "max_seq_len": 8192, "kvcache_partition_len": 4096},
+        )
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-0.8B")
+        inputs = tokenizer("Hello, my dog is cute", return_tensors="pt")
+        last_hidden_state = model(**inputs).last_hidden_state  # (1, sequence_length, hidden_size)
+        ```
     """
 
     _decoder_wrapper_cls = Qwen3_5_CausalLMWrapper
     _use_rotary_emb = True
+
+    @classmethod
+    def get_pytorch_model(cls, *args, **kwargs) -> PreTrainedModel:
+        if issubclass(cls.get_hf_class(), Qwen3_5TextModel):
+            # Qwen3.5 releases are vision-language checkpoints. transformers maps their text decoder from
+            # `model.language_model.*` (Qwen3_5ForConditionalGeneration) but not from `language_model.*` (a bare
+            # Qwen3_5Model, e.g. vllm-sr/d3), which it would leave randomly initialized.
+            kwargs.setdefault("key_mapping", {r"^(model\.)?language_model\.": "model."})
+        return super().get_pytorch_model(*args, **kwargs)
 
     def setup_runtime(self):
         _qwen3_5_setup_hybrid_runtime(self)
@@ -218,7 +247,12 @@ class RBLNQwen3_5TextModel(RBLNDecoderOnlyModel):
         if rbln_config.use_local_attention:
             input_info.append(("local_block_tables", [1] if is_prefill else [batch_size, 1], "int16"))
 
-        if cls.use_query_position(rbln_config.use_local_attention, is_prefill, rbln_config.logits_to_keep):
+        # The GatedDeltaNet prefill keeps the conv inputs ending at the window's last valid token (query_position), so
+        # a model with linear-attention layers takes it even when every position is kept (logits_to_keep == 0).
+        linear_layers = rbln_config.linear_attention_layers
+        if (is_prefill and linear_layers) or cls.use_query_position(
+            rbln_config.use_local_attention, is_prefill, rbln_config.logits_to_keep
+        ):
             input_info.append(("query_position", [], "int16"))
 
         if rbln_config.use_attention_mask:
@@ -229,8 +263,6 @@ class RBLNQwen3_5TextModel(RBLNDecoderOnlyModel):
             input_info.append(("lora_int_ids", [batch_size], "int32"))
 
         # per-layer state: full_attention -> paged KV (key, value); linear_attention -> (conv_state, recurrent_state).
-        linear_layers = rbln_config.linear_attention_layers
-
         if len(rbln_config.cache_metas) > 0:
             input_info.extend([(meta.name, meta.compile_shape, meta.dtype) for meta in rbln_config.cache_metas])
         else:
@@ -590,6 +622,10 @@ class RBLNQwen3_5Model(RBLNDecoderOnlyModel):
         _qwen3_5_setup_hybrid_runtime(self)
 
     @classmethod
+    def _get_compile_context(cls, compile_config, example_inputs):
+        return _qwen3_5_build_compile_context(compile_config, example_inputs)
+
+    @classmethod
     def _update_rbln_config(cls, preprocessors=None, model=None, model_config=None, rbln_config=None):
         rbln_config.linear_attention_layers = _qwen3_5_linear_layer_indices(model_config)
         rbln_config = super()._update_rbln_config(
@@ -799,10 +835,6 @@ class RBLNQwen3_5ForConditionalGeneration(RBLNQwenVLBatchSortMixin, RBLNQwen3_5M
 
     def can_generate(self):
         return True
-
-    @classmethod
-    def _get_compile_context(cls, compile_config, example_inputs):
-        return _qwen3_5_build_compile_context(compile_config, example_inputs)
 
     @classmethod
     def _reconstruct_model_if_needed(cls, model: "PreTrainedModel"):

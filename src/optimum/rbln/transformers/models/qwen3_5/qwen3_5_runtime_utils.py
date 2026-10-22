@@ -141,12 +141,10 @@ class RBLNQwen3_5RuntimeModel(RBLNRuntimeModel):
                     self.causal_mask
                 )
 
-            query_position = (
-                torch.tensor(
-                    (query_length - 1) % chunk if step + chunk >= query_length else chunk - 1, dtype=torch.int16
-                )
-                if self.rbln_config.logits_to_keep > 0
-                else None
+            # Last valid token of this window: the logits row for logits_to_keep == 1, and the end of the conv
+            # inputs the GatedDeltaNet carries to the next window.
+            query_position = torch.tensor(
+                (query_length - 1) % chunk if step + chunk >= query_length else chunk - 1, dtype=torch.int16
             )
 
             named = {"inputs_embeds" if self.rbln_config.use_inputs_embeds else "input_ids": input_chunk}
@@ -155,7 +153,7 @@ class RBLNQwen3_5RuntimeModel(RBLNRuntimeModel):
                 named["block_tables"] = block_tables
             if position_embed_chunk is not None:
                 named["position_emb"] = position_embed_chunk
-            if self.rbln_config.logits_to_keep > 0:
+            if self.rbln_config.logits_to_keep > 0 or self.rbln_config.linear_attention_layers:
                 named["query_position"] = query_position
             if self.rbln_config.use_attention_mask:
                 named["attention_mask"] = chunked_attention_mask
