@@ -3,6 +3,7 @@
 from typing import Any
 
 from .....configuration_utils import RBLNModelConfig
+from .....transformers import RBLNQwen3VLModelConfig, RBLNQwen3VLVisionModelConfig
 
 
 class RBLNQwen3VLTextEncoderConfig(RBLNModelConfig):
@@ -47,6 +48,57 @@ class RBLNQwen3VLTextEncoderConfig(RBLNModelConfig):
         self.exp_silu = bool(exp_silu)
 
 
+class RBLNQwenImage21VisionModelConfig(RBLNQwen3VLVisionModelConfig):
+    """
+    Configuration class for RBLNQwenImage21VisionModel: the Qwen3-VL vision transformer of the Qwen-Image 2.1 prompt
+    encoder, with the RBLN-CR13 precision option of its activation.
+    """
+
+    def __init__(self, exp_gelu: bool | None = None, **kwargs: Any):
+        """
+        Args:
+            exp_gelu (bool | None): On RBLN-CR13, compute the tanh GELU of the block MLPs in the exp form
+                (`replace_gelu_tanh_for_npu`), which keeps the precision the tanh kernel loses. Defaults to False.
+            kwargs: Additional arguments passed to the parent RBLNQwen3VLVisionModelConfig.
+        """
+        super().__init__(**kwargs)
+        self.exp_gelu = bool(exp_gelu)
+
+
+class RBLNQwenImage21TextEncoderConfig(RBLNQwen3VLModelConfig):
+    """
+    Configuration class for RBLNQwenImage21TextEncoder: a Qwen3-VL model as the prompt encoder of Qwen-Image 2.1,
+    with the options that encoder needs on top of RBLNQwen3VLModelConfig.
+    """
+
+    def __init__(
+        self,
+        visual: RBLNModelConfig | dict[str, Any] | None = None,
+        final_norm: bool | None = None,
+        exp_silu: bool | None = None,
+        **kwargs: Any,
+    ):
+        """
+        Args:
+            visual (RBLNModelConfig | dict | None): Configuration for the vision encoder submodule, an
+                RBLNQwenImage21VisionModelConfig unless another `cls_name` is given.
+            final_norm (bool | None): Whether the output goes through the final RMSNorm of the language model.
+                Qwen-Image reads the last decoder layer's output before it. Defaults to True.
+            exp_silu (bool | None): On RBLN-CR13, compute the SiLU of the MLPs in the exp form (`replace_silu_for_npu`),
+                which keeps the precision the fused SiLU kernel loses. Defaults to False.
+            kwargs: Additional arguments passed to the parent RBLNQwen3VLModelConfig.
+        """
+        if visual is None:
+            visual = {}
+        if isinstance(visual, dict):
+            visual = {"cls_name": "RBLNQwenImage21VisionModelConfig", **visual}
+        super().__init__(visual=visual, **kwargs)
+        self.final_norm = True if final_norm is None else final_norm
+        self.exp_silu = bool(exp_silu)
+
+
 __all__ = [
     "RBLNQwen3VLTextEncoderConfig",
+    "RBLNQwenImage21TextEncoderConfig",
+    "RBLNQwenImage21VisionModelConfig",
 ]
