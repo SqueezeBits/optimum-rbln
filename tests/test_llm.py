@@ -20,6 +20,7 @@ from transformers import (
     MixtralForCausalLM,
     Qwen2MoeConfig,
     Qwen2MoeForCausalLM,
+    Qwen3_5ForCausalLM,
     Qwen3MoeConfig,
     Qwen3MoeForCausalLM,
     Qwen3VLMoeConfig,
@@ -330,6 +331,40 @@ class TestQwen3_5ForCausalLM(LLMTest.TestLLM):
         config.layer_types = ["linear_attention", "linear_attention", "linear_attention", "full_attention"]
         cls.HF_CONFIG_KWARGS.update({"config": config, "ignore_mismatched_sizes": True})
         return super().setUpClass()
+
+
+class TestQwen3_5ForCausalLM_Eager(TestQwen3_5ForCausalLM):
+    # Eager attention takes the prefill window start from cache_position. The runtime right-pads the last window's
+    # cache_position with zeros, so a prompt that ends in a partial window must still start that window at its first
+    # position; with the minimum it was written over the start of the cache.
+    RBLN_CLASS_KWARGS = {
+        "rbln_config": {
+            "num_devices": 1,
+            "max_seq_len": 1024,
+            "kvcache_block_size": 1024,
+            "attn_impl": "eager",
+            "prefill_chunk_size": 128,
+        }
+    }
+
+    def test_partial_prefill_window_matches_hf(self):
+        if os.environ.get("REUSE_ARTIFACTS_PATH") is not None:
+            return
+        chunk_size = self.model.rbln_config.prefill_chunk_size
+        hf_model = Qwen3_5ForCausalLM.from_pretrained(self.HF_MODEL_ID, **self.HF_CONFIG_KWARGS, dtype=torch.float32)
+        # Natural text: the next token has to depend on the earlier window. With random token ids the logits barely
+        # depend on the context, and the bug (cosine 0.86 at chunk + 1 tokens) went unnoticed.
+        text = "The quick brown fox jumps over the lazy dog, and the dog chases the fox back home. " * 32
+        ids = self.get_tokenizer()(text, return_tensors="pt", add_special_tokens=False)["input_ids"]
+        for length in (chunk_size + 1, chunk_size + chunk_size // 2):
+            with self.subTest(length=length):
+                input_ids = ids[:, :length]
+                with torch.no_grad():
+                    expected = hf_model(input_ids=input_ids).logits[0, -1].float()
+                output = self.model(input_ids=input_ids)
+                logits = (output.logits if hasattr(output, "logits") else output[0])[0, -1].float()
+                cos = torch.nn.functional.cosine_similarity(logits, expected, dim=0).item()
+                assert cos > 0.99, f"last-token logits drifted from transformers (cosine {cos:.4f})"
 
 
 class TestOPTForCausalLM(LLMTest.TestLLM):
