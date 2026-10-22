@@ -19,3 +19,4 @@ Rules of this tree:
 
 | Model | Pipeline classes | Components | Verified on | Open points |
 | --- | --- | --- | --- | --- |
+| FLUX 3 Image Klein (`black-forest-labs/flux-3-image-klein`, `-base`) | `RBLNFlux3DistilledModularPipeline`, `RBLNFlux3ModularPipeline` | `RBLNFlux3Transformer2DModel`, `RBLNAutoencoderKLFlux2`, `RBLNQwen3VLTextEncoder`, `RBLNFlux3PromptUpsampler` | RBLN-CR13, one device, 1024-class sizes: text-to-image, editing with up to 10 references, layout control, distilled (16 steps) and base (CFG); 2048x2048 on two devices (text-to-image and editing) | FLUX.3 is only in diffusers `main`; the image-conditioned transformer graphs now and then give a wrong output on RBLN-CR13, so at the 2048 class they are re-run until two runs agree (`verify_outputs`); the 2048 output has not been measured against a reference |
