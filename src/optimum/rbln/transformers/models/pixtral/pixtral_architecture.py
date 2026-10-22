@@ -12,10 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional, Tuple
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 from ..decoderonly.decoderonly_architecture import apply_rotary_pos_emb
 
@@ -41,9 +40,10 @@ class PixtralAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        output_attentions: Optional[bool] = False,
+        attention_mask: torch.Tensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        output_attentions: bool | None = False,
+        **kwargs,
     ):
         batch_size, patches, _ = hidden_states.size()
 
@@ -63,7 +63,8 @@ class PixtralAttention(nn.Module):
 
         attn_weights = torch.matmul(query_states, key_states.transpose(3, 4)) * self.scaling
         attn_weights = attn_weights + attention_mask
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32)
+        # HF: softmax in fp32, probabilities cast back to the query dtype before P @ V.
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_output = torch.matmul(attn_weights, value_states)
         attn_output = attn_output.transpose(1, 3)
 

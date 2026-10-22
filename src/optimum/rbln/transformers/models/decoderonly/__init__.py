@@ -12,18 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ....ops import (
-    custom_moe_ff,
-    custom_moe_glu,
-    paged_attn_decode,
-    paged_attn_prefill,
-    paged_causal_attn_decode,
-    paged_causal_attn_prefill,
-    paged_flash_attn_decode,
-    paged_flash_attn_prefill,
-    paged_flash_causal_attn_decode,
-    paged_flash_causal_attn_prefill,
-)
-from .configuration_decoderonly import RBLNDecoderOnlyModelConfig, RBLNDecoderOnlyModelForCausalLMConfig
-from .configuration_lora import RBLNLoRAAdapterConfig, RBLNLoRAConfig
-from .modeling_decoderonly import RBLNDecoderOnlyModel, RBLNDecoderOnlyModelForCausalLM
+from typing import TYPE_CHECKING
+
+from transformers.utils import _LazyModule
+
+from ....utils.import_utils import define_import_structure
+
+
+if TYPE_CHECKING:
+    from .configuration_decoderonly import *
+    from .configuration_lora import *
+    from .modeling_decoderonly import *
+else:
+    import sys
+
+    _file = globals()["__file__"]
+    sys.modules[__name__] = _LazyModule(__name__, _file, define_import_structure(_file), module_spec=__spec__)

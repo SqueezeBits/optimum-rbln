@@ -26,7 +26,7 @@ class RBLNMixtralForCausalLMConfig(RBLNDecoderOnlyModelForCausalLMConfig):
     config = RBLNMixtralForCausalLMConfig(
         batch_size=1,
         max_seq_len=32768,
-        tensor_parallel_size=4
+        num_devices=4
     )
     # Use the configuration with from_pretrained
     model = RBLNMixtralForCausalLM.from_pretrained(
@@ -36,3 +36,8 @@ class RBLNMixtralForCausalLMConfig(RBLNDecoderOnlyModelForCausalLMConfig):
     )
     ```
     """
+
+
+__all__ = [
+    "RBLNMixtralForCausalLMConfig",
+]

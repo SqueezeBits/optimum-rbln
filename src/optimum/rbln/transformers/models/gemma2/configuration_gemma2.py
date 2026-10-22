@@ -26,7 +26,7 @@ class RBLNGemma2ForCausalLMConfig(RBLNDecoderOnlyModelForCausalLMConfig):
     config = RBLNGemma2ForCausalLMConfig(
         batch_size=1,
         max_seq_len=8192,
-        tensor_parallel_size=4
+        num_devices=4
     )
     # Use the configuration with from_pretrained
     model = RBLNGemma2ForCausalLM.from_pretrained(
@@ -43,3 +43,9 @@ class RBLNGemma2ModelConfig(RBLNDecoderOnlyModelConfig):
     Configuration class for RBLN Gemma2 models.
     This class is an alias of RBLNDecoderOnlyModelConfig.
     """
+
+
+__all__ = [
+    "RBLNGemma2ForCausalLMConfig",
+    "RBLNGemma2ModelConfig",
+]

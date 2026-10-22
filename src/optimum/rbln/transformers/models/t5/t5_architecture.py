@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Tuple
+
+from types import MethodType
 
 import torch
 from torch import nn
@@ -31,8 +32,56 @@ from ..seq2seq.seq2seq_architecture import (
 logger = logging.get_logger(__name__)
 
 
+def _clamp_finite(hidden_states: torch.Tensor) -> torch.Tensor:
+    # Upstream clamps only at float16, so gate on dtype to leave other graphs byte-identical -- comparing
+    # dtypes is static metadata, unlike the `isinf(...).any()` upstream feeds `torch.where`. Bound at the
+    # dtype's max rather than `max - 1000`: upstream only tightens to that when an inf is already present,
+    # so it would truncate finite activations upstream leaves alone, and T5 reaches that band.
+    if hidden_states.dtype != torch.float16:
+        return hidden_states
+    bound = torch.finfo(hidden_states.dtype).max
+    return torch.clamp(hidden_states, min=-bound, max=bound)
+
+
+def _encoder_block_forward(
+    self,
+    hidden_states,
+    attention_mask=None,
+    position_bias=None,
+    encoder_hidden_states=None,
+    encoder_attention_mask=None,
+    encoder_decoder_position_bias=None,
+    past_key_values=None,
+    use_cache=False,
+    output_attentions=False,
+    return_dict=True,
+    **kwargs,
+):
+    # Mirrors `T5Block.forward` for an encoder block, minus the cross-attention an encoder never runs
+    # and with the clamps unguarded: upstream builds their bound with `torch.where(...)`, a float32
+    # tensor that makes `clamp` mix dtypes under export.
+    self_attention_outputs = self.layer[0](
+        hidden_states,
+        attention_mask=attention_mask,
+        position_bias=position_bias,
+        past_key_values=past_key_values,
+        use_cache=use_cache,
+        output_attentions=output_attentions,
+    )
+    hidden_states = _clamp_finite(self_attention_outputs[0])
+    hidden_states = _clamp_finite(self.layer[-1](hidden_states))
+    return (hidden_states, *self_attention_outputs[1:])
+
+
+def patch_encoder_blocks(encoder: nn.Module) -> None:
+    """Swap in an export-safe forward on every block of a T5 encoder stack."""
+    for block in encoder.block:
+        block.forward = MethodType(_encoder_block_forward, block)
+
+
 class T5Wrapper:
-    def __init__(self, model: nn.Module, enc_max_seq_len: int, dec_max_seq_len: int = None):
+    def __init__(self, model: nn.Module, enc_max_seq_len: int, dec_max_seq_len: int | None = None):
+        patch_encoder_blocks(model.get_encoder())
         self.encoder = T5EncoderWrapper(model, enc_max_seq_len)
         self.decoder = T5DecoderWrapper(model, dec_max_seq_len=dec_max_seq_len)
 
@@ -53,7 +102,7 @@ class T5EncoderWrapper(Seq2SeqEncoderWrapper):
 
 
 class T5DecoderWrapper(Seq2SeqDecoderWrapper):
-    def __post_init__(self, model, dec_max_seq_len: int = None):
+    def __post_init__(self, model, dec_max_seq_len: int | None = None):
         self.num_layers = self.config.num_layers
         self.conditional_generation = self.convert_to_rbln_conditional_generation(model, dec_max_seq_len)
 
@@ -61,8 +110,7 @@ class T5DecoderWrapper(Seq2SeqDecoderWrapper):
         new_blocks = []
         for block in model.get_decoder().block:
             self_attn = T5LayerSelfAttention(block.layer[0].SelfAttention)
-            block = T5Block(block, self_attn)
-            new_blocks.append(block)
+            new_blocks.append(T5Block(block, self_attn))
 
         decoder_model = T5Decoder(model.get_decoder(), new_blocks, dec_max_seq_len=dec_max_seq_len)
         new_model = T5ForConditionalGeneration(model, decoder_model)
@@ -77,15 +125,15 @@ class T5DecoderWrapper(Seq2SeqDecoderWrapper):
         cache_position,
         block_tables,
         *kv_cache,
-    ) -> Tuple[torch.FloatTensor, Tuple[torch.FloatTensor]]:
+    ) -> tuple[torch.FloatTensor, tuple[torch.FloatTensor]]:
         self_past_key_values = ()
         cross_past_key_values = ()
         self_kv_cache = kv_cache[self.num_layers * 2 :]
         cross_kv_cache = kv_cache[: self.num_layers * 2]
 
         for i in range(0, self.num_layers * 2, 2):
-            self_past_key_values = self_past_key_values + ((self_kv_cache[i], self_kv_cache[i + 1]),)
-            cross_past_key_values = cross_past_key_values + ((cross_kv_cache[i], cross_kv_cache[i + 1]),)
+            self_past_key_values = (*self_past_key_values, (self_kv_cache[i], self_kv_cache[i + 1]))
+            cross_past_key_values = (*cross_past_key_values, (cross_kv_cache[i], cross_kv_cache[i + 1]))
 
         # decode
         lm_logits = self.conditional_generation(
@@ -111,7 +159,7 @@ class T5ForConditionalGeneration(Seq2SeqForConditionalGeneration):
 class T5Decoder(Seq2SeqDecoder):
     has_pos_emb = False
 
-    def __post_init__(self, model: nn.Module, dec_max_seq_len: int = None):
+    def __post_init__(self, model: nn.Module, dec_max_seq_len: int | None = None):
         self.invert_attention_mask = model.invert_attention_mask
         self._dec_position_bias = self.precompute_dec_position_bias(model, dec_max_seq_len)
 
@@ -150,19 +198,22 @@ class T5Block(Seq2SeqDecoderLayer):
         self.self_attn_layer_norm = decoder_layer.layer[0].layer_norm
         self.encoder_attn_layer_norm = decoder_layer.layer[1].layer_norm
         self.cross_attn = T5CrossAttention(decoder_layer.layer[1].EncDecAttention)
-        self.ff_layer = decoder_layer.layer[2]
+        self._ff_layer = decoder_layer.layer[2]
+
+    def ff_layer(self, hidden_states):
+        return _clamp_finite(self._ff_layer(hidden_states))
 
     def pre_self_attn_layer_norm(self, hidden_states):
         return self.self_attn_layer_norm(hidden_states)
 
     def post_self_attn_layer_norm(self, hidden_states):
-        return hidden_states
+        return _clamp_finite(hidden_states)
 
     def pre_cross_attn_layer_norm(self, hidden_states):
         return self.encoder_attn_layer_norm(hidden_states)
 
     def post_cross_attn_layer_norm(self, hidden_states):
-        return hidden_states
+        return _clamp_finite(hidden_states)
 
 
 class T5LayerSelfAttention(Seq2SeqSelfAttention):
@@ -175,7 +226,7 @@ class T5LayerSelfAttention(Seq2SeqSelfAttention):
         self.head_dim = attn.key_value_proj_dim
         self.attn_decode = torch.ops.rbln_custom_ops.paged_add_softmax_attn_decode
 
-    def projection(self, hidden_states) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def projection(self, hidden_states) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
@@ -184,12 +235,12 @@ class T5LayerSelfAttention(Seq2SeqSelfAttention):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        past_key_value: Tuple[torch.Tensor],
+        past_key_value: tuple[torch.Tensor],
         attention_mask: torch.Tensor,
         cache_position: torch.Tensor,
         block_tables: torch.Tensor,
         **kwargs,
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor]]:
         bsz, tgt_len, _ = hidden_states.size()
 
         query_states, key_states, value_states = self.projection(hidden_states=hidden_states)
@@ -208,7 +259,7 @@ class T5LayerSelfAttention(Seq2SeqSelfAttention):
             past_key_value[0].view(bsz, self.num_heads, 1, -1, self.head_dim),
             past_key_value[1].view(bsz, self.num_heads, 1, -1, self.head_dim),
             cache_position,
-            torch.tensor(1.0, dtype=torch.float32),  # scale
+            torch.tensor(1.0, dtype=query_states.dtype),  # scale
             block_tables,
             block_size,
         )
@@ -232,10 +283,10 @@ class T5CrossAttention(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor = None,
-        past_key_value: torch.Tensor = None,
-        attention_mask: torch.Tensor = None,
-        key_value_states: torch.Tensor = None,
+        hidden_states: torch.Tensor | None = None,
+        past_key_value: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        key_value_states: torch.Tensor | None = None,
     ):
         batch_size = hidden_states.shape[0]
 

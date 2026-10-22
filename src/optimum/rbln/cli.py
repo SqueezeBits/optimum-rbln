@@ -16,14 +16,16 @@
 import argparse
 import inspect
 import json
+import shutil
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Any, cast
 
+import rebel
 from huggingface_hub import hf_hub_download
 
 from .__version__ import __version__
-from .configuration_utils import RBLNModelConfig
+from .configuration_utils import RBLNModelConfig, load_config
 from .utils.model_utils import get_rbln_model_cls
 from .utils.runtime_utils import ContextRblnConfig
 
@@ -152,16 +154,16 @@ def _label(text: str) -> str:
 
 EXAMPLES_TEXT = r"""
 Quick start examples
-  1) Compile a Llama chat model for causal LM
-     optimum-rbln-cli --output-dir ./compiled_llama \
-       --model-id meta-llama/Llama-2-7b-chat-hf \
-       --batch-size 2 --tensor-parallel-size 4
+  1) Compile a Qwen3 chat model for causal LM
+     optimum-rbln-cli --output-dir ./compiled_qwen3 \
+       --model-id Qwen/Qwen3-4B \
+       --batch_size 1 --max_seq_len 8192 --num_devices 4
 
   2) Compile with explicit class (Auto sequence classification)
      optimum-rbln-cli --output-dir ./compiled_bert \
        --class RBLNAutoModelForSequenceClassification \
        --model-id bert-base-uncased \
-       --batch-size 8 --max-seq-len 512
+       --batch_size 8 --max_seq_len 512
 
   3) Pass nested rbln_config with dot-notation (e.g., for diffusion)
      optimum-rbln-cli --output-dir ./compiled_sd \
@@ -169,10 +171,10 @@ Quick start examples
        --unet.batch_size 2 --vae.batch_size 1
 
   4) Pass HuggingFace model arguments with --hf-* prefix
-     optimum-rbln-cli --output-dir ./compiled_llama \
-       --model-id meta-llama/Llama-2-7b-chat-hf \
+     optimum-rbln-cli --output-dir ./compiled_qwen3 \
+       --model-id Qwen/Qwen3-4B \
        --hf-trust-remote-code true --hf-dtype bfloat16 \
-       --batch-size 2 --tensor-parallel-size 4
+       --batch_size 1 --num_devices 4
 
 Notes
   - Any extra --key value pairs not defined above are collected into rbln_config
@@ -190,7 +192,7 @@ def _list_available_rbln_classes():
     """Return a sorted list of (name, kind) for available RBLN classes; kind in {"Model","Pipeline","Auto"}."""
     try:
         # Import lazily exposed module and enumerate public names
-        import optimum.rbln as rbln  # noqa: WPS433 (third-party import within function)
+        from optimum import rbln
 
         # Import bases for filtering
         RBLNBaseModel = getattr(rbln, "RBLNBaseModel", None)
@@ -312,11 +314,11 @@ def _print_rbln_config_options(class_name: str):
     # Curated: common compile-time options that live in RBLNModelConfig (non-runtime)
     print(_underline("\nCommon compile-time options (in rbln_config):"))
     print("  • npu: Target NPU for compilation (e.g., 'RBLN-CA25').")
-    print("  • tensor_parallel_size: Number of NPUs to shard the model at compile time.")
+    print("  • num_devices: Number of NPUs to shard the model across at compile time.")
 
     print(_underline("\nTips:"))
     print("  - Pass config keys as CLI flags, e.g., --batch_size 2 --max_seq_len 4096")
-    print("  - Compile-time examples: --npu RBLN-CA25 --tensor_parallel_size 4")
+    print("  - Compile-time examples: --npu RBLN-CA25 --num_devices 4")
     print("  - Use dot-notation for submodules, e.g., --vision_tower.image_size 336 --language_model.batch_size 1")
     print("  - To see examples: optimum-rbln-cli --examples")
 
@@ -325,12 +327,12 @@ def _read_json_from_model_id(
     model_id: str,
     filename: str,
     *,
-    hf_token: Optional[str] = None,
-    hf_revision: Optional[str] = None,
-    hf_cache_dir: Optional[str] = None,
+    hf_token: str | None = None,
+    hf_revision: str | None = None,
+    hf_cache_dir: str | None = None,
     hf_force_download: bool = False,
     hf_local_files_only: bool = False,
-) -> Optional[dict]:
+) -> dict | None:
     """Read a JSON file (e.g., config.json or model_index.json) from a local path or the HuggingFace Hub.
 
     Args:
@@ -375,12 +377,12 @@ def _read_json_from_model_id(
 def _infer_rbln_class_from_model_id(
     model_id: str,
     *,
-    hf_token: Optional[str] = None,
-    hf_revision: Optional[str] = None,
-    hf_cache_dir: Optional[str] = None,
+    hf_token: str | None = None,
+    hf_revision: str | None = None,
+    hf_cache_dir: str | None = None,
     hf_force_download: bool = False,
     hf_local_files_only: bool = False,
-) -> Optional[str]:
+) -> str | None:
     """Infer RBLN class name from model files by prefixing discovered class with 'RBLN'.
 
     Order of precedence:
@@ -422,6 +424,80 @@ def _infer_rbln_class_from_model_id(
     return None
 
 
+def _handle_kvcache_num_blocks(
+    model_id: str,
+    get: bool,
+    set_value: int | None,
+    output_dir: str | None = None,
+    set_memory_budget: str | None = None,
+) -> None:
+    """Read or set kvcache_num_blocks on an already-compiled local artifact directory.
+
+    `get` prints the current block count from rbln_config.json. To set, give either
+    `set_value` (an absolute block count) or `set_memory_budget` (a float/`"80%"`/bytes
+    budget, from which the largest fitting block count is computed). The kv-cache buffers
+    in every `*.rbln` are rescaled to the target and both the `.rbln` files and
+    rbln_config.json are written. With `output_dir` the source artifact is left untouched
+    and a full resized copy is written there; otherwise the edit is in place. Stateless:
+    rbln_config.json is the source of truth for the current block count.
+    """
+    from .transformers.modeling_attention_utils import RBLNDecoderOnlyFlashAttentionMixin
+    from .transformers.models.decoderonly.configuration_decoderonly import RBLNDecoderOnlyModelConfig
+
+    src_dir = Path(model_id)
+    if not (src_dir.exists() and src_dir.is_dir()):
+        raise ValueError(
+            f"--model-id must be a local compiled-artifact directory for this operation, got '{model_id}'."
+        )
+
+    config_cls, _ = load_config(model_id)
+    rbln_config = config_cls.from_pretrained(model_id)
+    if not (hasattr(rbln_config, "kvcache_num_blocks") and hasattr(rbln_config, "cache_metas")):
+        raise ValueError(
+            f"The model at '{model_id}' ({config_cls.__name__}) does not expose a top-level "
+            "resizable kv-cache. Only decoder-only causal LM artifacts are supported."
+        )
+    rbln_config = cast(RBLNDecoderOnlyModelConfig, rbln_config)
+
+    if get:
+        print(rbln_config.kvcache_num_blocks)
+        return
+
+    compiled_models = {p.stem: rebel.RBLNCompiledModel(p) for p in sorted(src_dir.glob("*.rbln"))}
+    if not compiled_models:
+        raise FileNotFoundError(f"No .rbln compiled models found in '{model_id}'.")
+
+    if set_value is not None:
+        target = set_value
+    else:
+        current = rbln_config.kvcache_num_blocks or 1
+        rbln_config.memory_budget = parse_value(set_memory_budget)
+        target = RBLNDecoderOnlyFlashAttentionMixin.estimate_num_kvcache_blocks(
+            compiled_models=compiled_models, rbln_config=rbln_config, current_blocks=current
+        )
+        print(f"memory_budget {set_memory_budget} fits kvcache_num_blocks={target}")
+
+    dst_dir = src_dir if output_dir is None else Path(output_dir)
+    if dst_dir.resolve() != src_dir.resolve():
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        for item in src_dir.iterdir():
+            if item.suffix == ".rbln" or item.name == "rbln_config.json":
+                continue
+            if item.is_dir():
+                shutil.copytree(item, dst_dir / item.name, dirs_exist_ok=True)
+            else:
+                shutil.copy2(item, dst_dir / item.name)
+
+    RBLNDecoderOnlyFlashAttentionMixin.rescale_kvcache_num_blocks(
+        compiled_models=compiled_models, rbln_config=rbln_config, target=target
+    )
+    for name, compiled_model in compiled_models.items():
+        compiled_model.save(dst_dir / f"{name}.rbln")
+    rbln_config.kvcache_num_blocks = target
+    rbln_config.save(str(dst_dir))
+    print(f"Set kvcache_num_blocks to {target} for artifact at {dst_dir.absolute()}")
+
+
 def main():
     """
     Main CLI function for optimum-rbln model compilation.
@@ -439,7 +515,7 @@ def main():
         return
 
     # Apply style preference as early as possible
-    global STYLES_ENABLED
+    global STYLES_ENABLED  # noqa: PLW0603
     if pre_args.no_style:
         STYLES_ENABLED = False
 
@@ -521,6 +597,33 @@ def main():
         help="Show rbln_config keys for the resolved RBLN class (via --class or inferred from --model-id) and exit",
     )
 
+    # Post-compilation kv-cache block-count operations on an existing --model-id directory
+    parser.add_argument(
+        "--get-kvcache-num-blocks",
+        dest="get_kvcache_num_blocks",
+        action="store_true",
+        help="Print kvcache_num_blocks of the compiled artifact at --model-id and exit (no compilation)",
+    )
+    parser.add_argument(
+        "--set-kvcache-num-blocks",
+        dest="set_kvcache_num_blocks",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Resize the kv-cache of the compiled artifact at --model-id to N blocks and exit (no compilation). "
+        "Edits in place unless --output-dir is given, in which case a resized copy is written there.",
+    )
+    parser.add_argument(
+        "--set-memory-budget",
+        dest="set_memory_budget",
+        type=str,
+        default=None,
+        metavar="BUDGET",
+        help="Resize the kv-cache of the compiled artifact at --model-id to the largest block count that fits "
+        "BUDGET, then exit (no compilation). BUDGET is a float fraction of the NPU available DRAM (e.g. 0.8), a "
+        "'80%%' string, or bytes ('10GB'). Mutually exclusive with --set-kvcache-num-blocks.",
+    )
+
     # Standard --version that integrates with argparse (works after full parse)
     parser.add_argument(
         "--version",
@@ -574,9 +677,30 @@ def main():
     # Parse known args to allow for additional rbln_* arguments
     args, unknown_args = parser.parse_known_args()
 
+    # Post-compilation kv-cache block-count operations short-circuit the compile flow.
+    if args.get_kvcache_num_blocks or args.set_kvcache_num_blocks is not None or args.set_memory_budget is not None:
+        if args.set_kvcache_num_blocks is not None and args.set_memory_budget is not None:
+            print("--set-kvcache-num-blocks and --set-memory-budget are mutually exclusive.", file=sys.stderr)
+            sys.exit(2)
+        # --output-dir has a compile default; only honor it here when explicitly passed.
+        explicit_output = "--output-dir" in sys.argv or "-o" in sys.argv
+        output_dir = args.output_dir if explicit_output else None
+        try:
+            _handle_kvcache_num_blocks(
+                args.model_id,
+                args.get_kvcache_num_blocks,
+                args.set_kvcache_num_blocks,
+                output_dir,
+                args.set_memory_budget,
+            )
+        except Exception as e:
+            print(f"❌ Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
+
     try:
         # Resolve or infer model class for compilation
-        resolved_class_name: Optional[str] = args.model_class
+        resolved_class_name: str | None = args.model_class
         if not resolved_class_name:
             resolved_class_name = _infer_rbln_class_from_model_id(
                 args.model_id,
@@ -613,8 +737,8 @@ def main():
         output_path.mkdir(parents=True, exist_ok=True)
 
         # Prepare rbln_config and model_kwargs by parsing all unknown arguments
-        rbln_config = {}
-        model_kwargs = {}  # HuggingFace model args
+        rbln_config: dict[str, Any] = {}
+        model_kwargs: dict[str, Any] = {}  # HuggingFace model args
 
         # Parse all unknown arguments
         i = 0
@@ -642,22 +766,20 @@ def main():
 
                     if is_hf_arg:
                         model_kwargs[arg_name] = parsed_value
+                    # Check if this is a nested config argument (contains dots)
+                    elif "." in arg_name:
+                        set_nested_dict(rbln_config, arg_name, parsed_value)
                     else:
-                        # Check if this is a nested config argument (contains dots)
-                        if "." in arg_name:
-                            set_nested_dict(rbln_config, arg_name, parsed_value)
-                        else:
-                            rbln_config[arg_name] = parsed_value
+                        rbln_config[arg_name] = parsed_value
                     i += 2
                 else:
                     # Boolean flag
                     if is_hf_arg:
                         model_kwargs[arg_name] = True
+                    elif "." in arg_name:
+                        set_nested_dict(rbln_config, arg_name, True)
                     else:
-                        if "." in arg_name:
-                            set_nested_dict(rbln_config, arg_name, True)
-                        else:
-                            rbln_config[arg_name] = True
+                        rbln_config[arg_name] = True
                     i += 1
             else:
                 i += 1

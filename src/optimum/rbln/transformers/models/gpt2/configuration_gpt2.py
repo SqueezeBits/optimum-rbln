@@ -37,7 +37,7 @@ class RBLNGPT2ModelConfig(RBLNDecoderOnlyModelConfig):
     config = RBLNGPT2ModelConfig(
         batch_size=1,
         max_seq_len=1024,
-        tensor_parallel_size=4
+        num_devices=4
     )
 
     # Use the configuration with from_pretrained
@@ -48,3 +48,9 @@ class RBLNGPT2ModelConfig(RBLNDecoderOnlyModelConfig):
     )
     ```
     """
+
+
+__all__ = [
+    "RBLNGPT2LMHeadModelConfig",
+    "RBLNGPT2ModelConfig",
+]

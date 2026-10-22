@@ -12,11 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
 
 import torch
-import torch.nn as nn
+from torch import nn
 
+from ...utils.moe import compute_masked_routing_weight_softmax_first, split_fused_experts
 from ..decoderonly.configuration_lora import RBLNLoRAConfig
 from ..decoderonly.decoderonly_architecture import DecoderOnlyAttention, DecoderOnlyLayer
 from ..qwen3_vl.qwen3_vl_architecture import (
@@ -42,7 +42,7 @@ class Qwen3VLMoeAttention(Qwen3VLAttention):
 
 
 class Qwen3VLMoeLayer(DecoderOnlyLayer):
-    def __init__(self, layer, self_attn: DecoderOnlyAttention, lora_config: Optional[RBLNLoRAConfig] = None):
+    def __init__(self, layer, self_attn: DecoderOnlyAttention, lora_config: RBLNLoRAConfig | None = None):
         super().__init__(layer, self_attn, lora_config)
         self.mlp = (
             Qwen3VLMoeSparseMoeBlock(layer.mlp)
@@ -57,9 +57,12 @@ class Qwen3VLMoeLayer(DecoderOnlyLayer):
 class Qwen3VLMoeSparseMoeBlock(nn.Module):
     def __init__(self, model: nn.Module):
         super().__init__()
-        self.num_experts = model.num_experts
-        self.top_k = model.top_k
-        self.gate = model.gate
+        self.num_experts = model.gate.num_experts
+        self.top_k = model.gate.top_k
+        gate_weight = model.gate.weight
+        gate = nn.Linear(gate_weight.shape[1], gate_weight.shape[0], bias=False)
+        gate.weight = model.gate.weight
+        self.gate = gate
         self.experts = Qwen3VLMoeMLP(model.experts, self.top_k)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -76,37 +79,27 @@ class Qwen3VLMoeSparseMoeBlock(nn.Module):
 class Qwen3VLMoeMLP(nn.Module):
     def __init__(self, experts: nn.Module, top_k: int):
         super().__init__()
-        self.hidden_size = experts.hidden_size
-        self.intermediate_size = experts.intermediate_size
         self.num_experts = experts.num_experts
         self.top_k = top_k
         self.norm_topk_prob = True
 
-        self.gate_proj = nn.Linear(self.hidden_size, self.num_experts * self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.num_experts * self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.num_experts * self.intermediate_size, self.hidden_size, bias=False)
-
-        gate_up = experts.gate_up_proj
-        expert_dim = experts.expert_dim
-        self.gate_proj.weight.data = torch.stack(
-            [gate_up[expert_idx, :, :expert_dim].transpose(0, 1) for expert_idx in range(self.num_experts)], dim=0
-        )
-        self.up_proj.weight.data = torch.stack(
-            [gate_up[expert_idx, :, expert_dim:].transpose(0, 1) for expert_idx in range(self.num_experts)], dim=0
-        )
-        self.down_proj.weight.data = torch.stack(
-            [experts.down_proj[expert_idx].transpose(0, 1) for expert_idx in range(self.num_experts)], dim=0
-        )
+        # Fused Qwen3VLMoeTextExperts: gate_up_proj [E, 2I, H], down_proj [E, H, I].
+        gate, up, down = split_fused_experts(experts)
+        self.register_buffer("gate_proj_weight", gate)
+        self.register_buffer("up_proj_weight", up)
+        self.register_buffer("down_proj_weight", down)
 
     def forward(self, x: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
+        masked_routing_weight = compute_masked_routing_weight_softmax_first(
+            router_logits, top_k=self.top_k, renormalize=self.norm_topk_prob
+        )
         return torch.ops.rbln_custom_ops.custom_moe_glu(
-            x,
-            self.gate_proj.weight,
-            self.up_proj.weight,
-            self.down_proj.weight,
-            router_logits,
-            self.top_k,
-            self.norm_topk_prob,
+            hidden_states=x,
+            gate_proj_weight=self.gate_proj_weight,
+            up_proj_weight=self.up_proj_weight,
+            down_proj_weight=self.down_proj_weight,
+            masked_routing_weight=masked_routing_weight,
+            hidden_act="silu",
         )
 
 

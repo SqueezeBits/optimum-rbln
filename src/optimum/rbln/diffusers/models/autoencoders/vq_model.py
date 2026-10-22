@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import TYPE_CHECKING, Any, List, Union
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any
 
 import rebel
 import torch
@@ -22,6 +23,7 @@ from diffusers.models.autoencoders.vq_model import VQEncoderOutput
 
 from ....configuration_utils import RBLNCompileConfig, RBLNModelConfig
 from ....modeling import RBLNModel
+from ....modeling_base import Preprocessor
 from ....utils.logging import get_logger
 from ...configurations.models.configuration_vq_model import RBLNVQModelConfig
 from ...modeling_diffusers import RBLNDiffusionMixin, RBLNDiffusionMixinConfig
@@ -29,7 +31,7 @@ from .vae import RBLNRuntimeVQDecoder, RBLNRuntimeVQEncoder, _VQDecoder, _VQEnco
 
 
 if TYPE_CHECKING:
-    from transformers import AutoFeatureExtractor, AutoProcessor, AutoTokenizer, PretrainedConfig, PreTrainedModel
+    from transformers import PretrainedConfig, PreTrainedModel
 
 logger = get_logger(__name__)
 
@@ -96,7 +98,7 @@ class RBLNVQModel(RBLNModel):
     @classmethod
     def _update_rbln_config(
         cls,
-        preprocessors: Union["AutoFeatureExtractor", "AutoProcessor", "AutoTokenizer"],
+        preprocessors: Sequence[Preprocessor],
         model: "PreTrainedModel",
         model_config: "PretrainedConfig",
         rbln_config: RBLNVQModelConfig,
@@ -118,7 +120,7 @@ class RBLNVQModel(RBLNModel):
                         rbln_config.sample_size[0],
                         rbln_config.sample_size[1],
                     ],
-                    "float32",
+                    rbln_config.dtype,
                 )
             ]
             enc_rbln_compile_config = RBLNCompileConfig(compiled_model_name="encoder", input_info=enc_input_info)
@@ -133,7 +135,7 @@ class RBLNVQModel(RBLNModel):
                     rbln_config.latent_sample_size[0],
                     rbln_config.latent_sample_size[1],
                 ],
-                "float32",
+                rbln_config.dtype,
             )
         ]
         dec_rbln_compile_config = RBLNCompileConfig(compiled_model_name="decoder", input_info=dec_input_info)
@@ -145,9 +147,9 @@ class RBLNVQModel(RBLNModel):
     @classmethod
     def _create_runtimes(
         cls,
-        compiled_models: List[rebel.RBLNCompiledModel],
+        compiled_models: list[rebel.RBLNCompiledModel],
         rbln_config: RBLNVQModelConfig,
-    ) -> List[rebel.Runtime]:
+    ) -> list[rebel.Runtime]:
         if len(compiled_models) == 1:
             # decoder
             expected_models = ["decoder"]
@@ -172,7 +174,7 @@ class RBLNVQModel(RBLNModel):
 
     def encode(
         self, x: torch.FloatTensor, return_dict: bool = True, **kwargs: Any
-    ) -> Union[torch.FloatTensor, VQEncoderOutput]:
+    ) -> torch.FloatTensor | VQEncoderOutput:
         """
         Encode an input image into a quantized latent representation.
 
@@ -185,14 +187,14 @@ class RBLNVQModel(RBLNModel):
         Returns:
             The quantized latent representation or a specific output object.
         """
-        posterior = self.encoder.encode(x)
+        posterior = self.encoder.encode(x.to(self.rbln_config.dtype))
         if not return_dict:
             return (posterior,)
         return VQEncoderOutput(latents=posterior)
 
     def decode(
         self, h: torch.FloatTensor, return_dict: bool = True, **kwargs: Any
-    ) -> Union[torch.FloatTensor, DecoderOutput]:
+    ) -> torch.FloatTensor | DecoderOutput:
         """
         Decode a quantized latent representation back into an image.
 
@@ -205,7 +207,12 @@ class RBLNVQModel(RBLNModel):
         Returns:
             The decoded image or a DecoderOutput object.
         """
-        dec, commit_loss = self.decoder.decode(h, **kwargs)
+        dec, commit_loss = self.decoder.decode(h.to(self.rbln_config.dtype), **kwargs)
         if not return_dict:
             return (dec, commit_loss)
         return DecoderOutput(sample=dec, commit_loss=commit_loss)
+
+
+__all__ = [
+    "RBLNVQModel",
+]

@@ -21,13 +21,16 @@
 # copied, modified, or distributed without prior written permission
 # from Rebellions Inc.
 
-from typing import Optional, Tuple, Union
+
+from types import MethodType
 
 import torch
 from torch import nn
 from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
 from transformers.modeling_outputs import BaseModelOutput, Seq2SeqLMOutput
 from transformers.utils import logging
+
+from ..bart.bart_architecture import _encoder_layer_forward
 
 
 logger = logging.get_logger(__name__)
@@ -44,6 +47,9 @@ class TimeSeriesTransformersEncoderWrapper(torch.nn.Module):
         super().__init__()
         self.config = model.config
         self.encoder = model.get_encoder()
+        # Same layer layout and data-dependent fp16 clamp guard as BART.
+        for layer in self.encoder.layers:
+            layer.forward = MethodType(_encoder_layer_forward, layer)
         self.num_heads = self.config.decoder_attention_heads
         self.d_kv = self.config.d_model // self.num_heads
         self.cross_k_projects, self.cross_v_projects = self._extract_cross_kv_projects(model.get_decoder().layers)
@@ -58,7 +64,7 @@ class TimeSeriesTransformersEncoderWrapper(torch.nn.Module):
         self,
         inputs_embeds: torch.Tensor,
         cross_key_values: torch.Tensor,  # n_layers, batch_size, num_heads, context_length, d_kv
-    ) -> Union[Tuple[torch.FloatTensor], BaseModelOutput]:
+    ) -> tuple[torch.FloatTensor] | BaseModelOutput:
         # 1. get encoder last_hidden_states
         encoder_outputs = self.encoder(inputs_embeds=inputs_embeds, attention_mask=None, return_dict=False)
         last_hidden_states = encoder_outputs[0]
@@ -110,13 +116,13 @@ class TimeSeriesTransformersDecoderWrapper(torch.nn.Module):
         block_tables: torch.Tensor,
         cross_kv_cache: torch.Tensor,  # batch_size, num_heads, context_length, d_kv
         *self_kv_cache: torch.Tensor,  # batch_size * num_parallel_samples, num_heads, prediction_length, d_kv
-    ) -> Union[Tuple[torch.FloatTensor], Seq2SeqLMOutput]:
+    ) -> tuple[torch.FloatTensor] | Seq2SeqLMOutput:
         # prepare past_key_values
         self_past_key_values = ()
         cross_past_key_values = ()
         for i in range(0, self.num_layers * 2, 2):
-            self_past_key_values = self_past_key_values + ((self_kv_cache[i], self_kv_cache[i + 1]),)
-            cross_past_key_values = cross_past_key_values + ((cross_kv_cache[i], cross_kv_cache[i + 1]),)
+            self_past_key_values = (*self_past_key_values, (self_kv_cache[i], self_kv_cache[i + 1]))
+            cross_past_key_values = (*cross_past_key_values, (cross_kv_cache[i], cross_kv_cache[i + 1]))
 
         # Decode
         last_hidden_states = self.decoder(
@@ -148,12 +154,12 @@ class TimeSeriesTransformersDecoder(nn.Module):
 
     def forward(
         self,
-        inputs_embeds: torch.Tensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        self_past_key_values: Optional[torch.Tensor] = None,
-        cross_past_key_values: Optional[torch.Tensor] = None,
-        cache_position: Optional[torch.Tensor] = None,
-        block_tables: torch.Tensor = None,
+        inputs_embeds: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        self_past_key_values: torch.Tensor | None = None,
+        cross_past_key_values: torch.Tensor | None = None,
+        cache_position: torch.Tensor | None = None,
+        block_tables: torch.Tensor | None = None,
     ):
         input_shape = inputs_embeds.size()[:-1]
 
@@ -202,11 +208,11 @@ class TimeSeriesTransformersDecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        self_past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        cross_past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        cache_position: Optional[torch.Tensor] = None,
-        block_tables: torch.Tensor = None,
+        attention_mask: torch.Tensor | None = None,
+        self_past_key_value: tuple[torch.Tensor] | None = None,
+        cross_past_key_value: tuple[torch.Tensor] | None = None,
+        cache_position: torch.Tensor | None = None,
+        block_tables: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Self Attention Block
         residual = hidden_states
@@ -264,11 +270,11 @@ class TimeSeriesTransformersSelfAttention(TimeSeriesTransformersAttention):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        cache_position: Optional[torch.Tensor] = None,
-        block_tables: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        past_key_value: tuple[torch.Tensor] | None = None,
+        attention_mask: torch.Tensor | None = None,
+        cache_position: torch.Tensor | None = None,
+        block_tables: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
         bsz, tgt_len, _ = hidden_states.size()
         query_states = self._shape(self.q_proj(hidden_states), tgt_len, bsz)
         query_states = query_states * self.scaling
@@ -285,7 +291,7 @@ class TimeSeriesTransformersSelfAttention(TimeSeriesTransformersAttention):
             kcache=past_key_value[0].view(1, bsz * self.num_heads, 1, -1, self.head_dim),
             vcache=past_key_value[1].view(1, bsz * self.num_heads, 1, -1, self.head_dim),
             seq=cache_position.expand(bsz, 1),
-            scale=torch.tensor(1.0, dtype=torch.float32),  # scale
+            scale=torch.tensor(1.0, dtype=query_states.dtype),  # scale
             block_table=block_tables,
             block_size=block_size,
         )
@@ -302,8 +308,8 @@ class TimeSeriesTransformersCrossAttention(TimeSeriesTransformersSelfAttention):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        past_key_value: tuple[torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
         batch_size, query_len, _ = hidden_states.size()
         query_states = (
             self.q_proj(hidden_states)
@@ -322,7 +328,6 @@ class TimeSeriesTransformersCrossAttention(TimeSeriesTransformersSelfAttention):
         value_states = past_key_value[1].unsqueeze(1)
 
         attn_weights = torch.matmul(query_states, key_states.transpose(3, 4))
-        attn_weights = attn_weights
         attn_weights = nn.functional.softmax(attn_weights, dim=-1)
 
         attn_output = torch.matmul(attn_weights, value_states)

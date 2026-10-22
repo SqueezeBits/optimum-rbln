@@ -15,11 +15,13 @@ import importlib
 import inspect
 import warnings
 from pathlib import Path
-from typing import Any, Dict, Optional, Type, Union
+from typing import Any
 
+import transformers
 from transformers import AutoConfig, PretrainedConfig, PreTrainedModel
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 from transformers.models.auto.auto_factory import _get_model_class
+from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
 from optimum.rbln.configuration_utils import RBLNAutoConfig, RBLNModelConfig
 from optimum.rbln.modeling_base import RBLNBaseModel
@@ -31,12 +33,34 @@ from optimum.rbln.utils.model_utils import (
 )
 
 
+def _upgrade_bare_config(config: PretrainedConfig) -> PretrainedConfig:
+    """Rebuild a bare ``PretrainedConfig`` as its concrete config class.
+
+    Non-HF config parsers (e.g. vLLM's mistral-format loader) hand over an
+    instance of the base ``PretrainedConfig``, whose class carries no model
+    identity and whose ``model_type`` can be a parser artifact ("transformer").
+    Recover the concrete class from ``architectures`` so class-based model
+    resolution and eager model loading work downstream. Returns the config
+    unchanged if the architecture cannot be resolved.
+    """
+    architectures = getattr(config, "architectures", None) or []
+    hf_model_cls = getattr(transformers, architectures[0], None) if architectures else None
+    config_cls = getattr(hf_model_cls, "config_class", None)
+    if config_cls is None:
+        return config
+
+    config_dict = config.to_dict()
+    # Drop the parser's model_type so the concrete class's canonical one wins.
+    config_dict.pop("model_type", None)
+    return config_cls.from_dict(config_dict)
+
+
 class _BaseAutoModelClass:
     # Base class for auto models.
     _model_mapping = None
 
     def __init__(self, *args, **kwargs):
-        raise EnvironmentError(
+        raise OSError(
             f"{self.__class__.__name__} is designed to be instantiated "
             f"using the `{self.__class__.__name__}.from_pretrained(pretrained_model_name_or_path)`"
         )
@@ -44,9 +68,9 @@ class _BaseAutoModelClass:
     @classmethod
     def get_rbln_cls(
         cls,
-        pretrained_model_name_or_path: Union[str, Path],
+        pretrained_model_name_or_path: str | Path,
         *args: Any,
-        export: bool = None,
+        export: bool | None = None,
         **kwargs: Any,
     ):
         """
@@ -100,7 +124,7 @@ class _BaseAutoModelClass:
     @classmethod
     def infer_hf_model_class(
         cls,
-        pretrained_model_name_or_path: Union[str, Path],
+        pretrained_model_name_or_path: str | Path,
         *args: Any,
         **kwargs: Any,
     ):
@@ -117,30 +141,40 @@ class _BaseAutoModelClass:
 
         # Try to load configuration if provided or retrieve it from the model ID
         config = kwargs.pop("config", None)
-        kwargs.update({"trust_remote_code": True})
+        trust_remote_code = kwargs.pop("trust_remote_code", None)
         kwargs["_from_auto"] = True
 
-        # Load configuration if not already provided
+        # Like transformers' Auto classes, a model type transformers implements resolves to its built-in class
+        # unless the caller opts into remote code. A checkpoint's `auto_map` can point at remote code that no
+        # longer imports (Phi-4-mini's modeling_phi3.py imports the removed `LossKwargs`). Checkpoints that only
+        # ship remote code keep loading it by default.
         if not isinstance(config, PretrainedConfig):
+            if trust_remote_code is None:
+                config_dict, _ = PretrainedConfig.get_config_dict(pretrained_model_name_or_path, **kwargs)
+                trust_remote_code = config_dict.get("model_type") not in CONFIG_MAPPING
             config, kwargs = AutoConfig.from_pretrained(
                 pretrained_model_name_or_path,
                 return_unused_kwargs=True,
+                trust_remote_code=trust_remote_code,
                 **kwargs,
             )
+
+        if type(config) is PretrainedConfig:
+            config = _upgrade_bare_config(config)
 
         # Get hf_model_class from Config
         has_remote_code = (
             hasattr(config, "auto_map") and convert_rbln_to_hf_model_name(cls.__name__) in config.auto_map
         )
-        if has_remote_code:
+        if has_remote_code and (trust_remote_code or type(config) not in cls._model_mapping):
             class_ref = config.auto_map[convert_rbln_to_hf_model_name(cls.__name__)]
             model_class = get_class_from_dynamic_module(class_ref, pretrained_model_name_or_path, **kwargs)
-        elif type(config) in cls._model_mapping.keys():
+        elif type(config) in cls._model_mapping:
             model_class = _get_model_class(config, cls._model_mapping)
         else:
             raise ValueError(
                 f"Unrecognized configuration class {config.__class__} for this kind of AutoModel: {cls.__name__}.\n"
-                f"Model type should be one of {', '.join(c.__name__ for c in cls._model_mapping.keys())}."
+                f"Model type should be one of {', '.join(c.__name__ for c in cls._model_mapping)}."
             )
 
         if model_class.__name__ != config.architectures[0]:
@@ -156,7 +190,7 @@ class _BaseAutoModelClass:
         return model_class
 
     @classmethod
-    def get_rbln_model_cls_name(cls, pretrained_model_name_or_path: Union[str, Path], **kwargs):
+    def get_rbln_model_cls_name(cls, pretrained_model_name_or_path: str | Path, **kwargs):
         """
         Retrieve the path to the compiled model directory for a given RBLN model.
 
@@ -174,17 +208,17 @@ class _BaseAutoModelClass:
         model_path_subfolder = RBLNBaseModel._load_compiled_model_dir(
             model_id=pretrained_model_name_or_path, **filtered_kwargs
         )
-        rbln_config = RBLNAutoConfig.load(model_path_subfolder)
+        rbln_config = RBLNAutoConfig.from_pretrained(model_path_subfolder)
 
         return rbln_config.rbln_model_cls_name
 
     @classmethod
     def from_pretrained(
         cls,
-        model_id: Union[str, Path],
-        export: bool = None,
-        rbln_config: Optional[Union[Dict, RBLNModelConfig]] = None,
-        **kwargs: Optional[Dict[str, Any]],
+        model_id: str | Path,
+        export: bool | None = None,
+        rbln_config: dict | RBLNModelConfig | None = None,
+        **kwargs: dict[str, Any] | None,
     ) -> RBLNBaseModel:
         """
         Load an RBLN-accelerated model from a pretrained checkpoint or a compiled RBLN artifact.
@@ -215,6 +249,11 @@ class _BaseAutoModelClass:
         Returns:
             RBLNBaseModel: An instantiated RBLN model ready for inference on RBLN NPUs.
         """
+        # Upgrade here (not only in infer_hf_model_class) so the concrete
+        # config also reaches the resolved class's from_pretrained.
+        if type(kwargs.get("config")) is PretrainedConfig:
+            kwargs["config"] = _upgrade_bare_config(kwargs["config"])
+
         rbln_cls = cls.get_rbln_cls(model_id, export=export, **kwargs)
         return rbln_cls.from_pretrained(model_id, export=export, rbln_config=rbln_config, **kwargs)
 
@@ -222,8 +261,8 @@ class _BaseAutoModelClass:
     def from_model(
         cls,
         model: PreTrainedModel,
-        config: Optional[PretrainedConfig] = None,
-        rbln_config: Optional[Union[RBLNModelConfig, Dict]] = None,
+        config: PretrainedConfig | None = None,
+        rbln_config: RBLNModelConfig | dict | None = None,
         **kwargs: Any,
     ) -> RBLNBaseModel:
         """
@@ -249,12 +288,12 @@ class _BaseAutoModelClass:
         return rbln_cls.from_model(model, config=config, rbln_config=rbln_config, **kwargs)
 
     @staticmethod
-    def register(rbln_cls: Type[RBLNBaseModel], exist_ok: bool = False):
+    def register(rbln_cls: type[RBLNBaseModel], exist_ok: bool = False):
         """
         Register a new RBLN model class.
 
         Args:
-            rbln_cls (Type[RBLNBaseModel]): The RBLN model class to register.
+            rbln_cls (type[RBLNBaseModel]): The RBLN model class to register.
             exist_ok (bool): Whether to allow registering an already registered model.
         """
         if not issubclass(rbln_cls, RBLNBaseModel):

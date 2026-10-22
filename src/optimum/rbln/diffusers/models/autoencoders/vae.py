@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import TYPE_CHECKING, List, Union
+from typing import TYPE_CHECKING, Union
 
 import torch
+from diffusers.models.autoencoders.autoencoder_kl_wan import patchify as wan_patchify
+from diffusers.models.autoencoders.autoencoder_kl_wan import unpatchify as wan_unpatchify
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution, IdentityDistribution
 
 from ....utils.runtime_utils import RBLNPytorchRuntime
@@ -55,6 +57,53 @@ class RBLNRuntimeCosmosVAEDecoder(RBLNPytorchRuntime):
         else:
             decoded = self.forward(z)
         return decoded
+
+
+class RBLNRuntimeWanVAEEncoder(RBLNPytorchRuntime):
+    mandatory_members = ["main_input_name", "encoder_n", "patch_size", "dtype"]
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.to(self.dtype)
+        if self.patch_size is not None:
+            x = wan_patchify(x, patch_size=self.patch_size)
+
+        _, _, num_frame, _, _ = x.shape
+        outs = []
+        feat_cache_0 = None
+        for i in range(1 + (num_frame - 1) // 4):
+            if i == 0:
+                ret = self.forward(x[:, :, :1, :, :])
+            else:
+                ret = self.encoder_n(x[:, :, 1 + 4 * (i - 1) : 1 + 4 * i, :, :], feat_cache_0)
+            out_i, feat_cache_0 = ret[0], ret[1]
+            outs.append(out_i)
+
+        return torch.cat(outs, dim=2) if len(outs) > 1 else outs[0]
+
+
+class RBLNRuntimeWanVAEDecoder(RBLNPytorchRuntime):
+    mandatory_members = ["main_input_name", "decoder_n", "patch_size", "dtype", "post_quant_conv"]
+
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        z = z.to(self.dtype)
+        if self.post_quant_conv is not None:
+            z = self.post_quant_conv.to(z.dtype)(z)
+
+        _, _, num_frame, _, _ = z.shape
+        outs = []
+        feat_cache_0 = None
+        for i in range(num_frame):
+            if i == 0:
+                ret = self.forward(z[:, :, :1, :, :])
+            else:
+                ret = self.decoder_n(z[:, :, i : i + 1, :, :], feat_cache_0)
+            out_i, feat_cache_0 = ret[0], ret[1]
+            outs.append(out_i)
+
+        out = torch.cat(outs, dim=2) if len(outs) > 1 else outs[0]
+        if self.patch_size is not None:
+            out = wan_unpatchify(out, patch_size=self.patch_size)
+        return torch.clamp(out, min=-1.0, max=1.0)
 
 
 class _VAEDecoder(torch.nn.Module):
@@ -136,12 +185,12 @@ class RBLNRuntimeVQEncoder(RBLNPytorchRuntime):
 
 
 class RBLNRuntimeVQDecoder(RBLNPytorchRuntime):
-    def decode(self, h: torch.Tensor, force_not_quantize: bool = False, shape=None, **kwargs) -> List[torch.Tensor]:
+    def decode(self, h: torch.Tensor, force_not_quantize: bool = False, shape=None, **kwargs) -> list[torch.Tensor]:
         if not (force_not_quantize and not self.lookup_from_codebook):
             raise ValueError(
                 "Currently, the `decode` method of the class `RBLNVQModel` is executed successfully only if `force_not_quantize` is True and `config.lookup_from_codebook` is False"
             )
-        commit_loss = torch.zeros((h.shape[0])).to(h.device, dtype=h.dtype)
+        commit_loss = torch.zeros(h.shape[0]).to(h.device, dtype=h.dtype)
         dec = self.forward(h.contiguous())
         return dec, commit_loss
 

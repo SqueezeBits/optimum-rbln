@@ -21,8 +21,10 @@ different model architectures.
 """
 
 import inspect
-from typing import TYPE_CHECKING, Optional, Union
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any, ClassVar
 
+import torch
 from torch import nn
 from transformers import (
     AutoModel,
@@ -36,8 +38,9 @@ from transformers import (
 )
 from transformers.modeling_outputs import BaseModelOutput, QuestionAnsweringModelOutput
 
-from ..configuration_utils import RBLNCompileConfig
+from ..configuration_utils import RBLNCompileConfig, TypeInputInfo
 from ..modeling import RBLNModel
+from ..modeling_base import Preprocessor
 from ..utils.logging import get_logger
 from .configuration_generic import (
     RBLNImageModelConfig,
@@ -46,15 +49,16 @@ from .configuration_generic import (
 
 
 if TYPE_CHECKING:
-    from transformers import AutoFeatureExtractor, AutoProcessor, AutoTokenizer, PreTrainedModel
+    from transformers import PreTrainedModel
 
 logger = get_logger()
 
 
 class RBLNTransformerEncoder(RBLNModel):
-    auto_model_class = AutoModel
+    auto_model_class: ClassVar[type[Any]] = AutoModel
     rbln_model_input_names = ["input_ids", "attention_mask", "token_type_ids"]
     rbln_dtype = "int64"
+    rbln_config: RBLNTransformerEncoderConfig
 
     @classmethod
     def _wrap_model_if_needed(cls, model: "PreTrainedModel", rbln_config: RBLNTransformerEncoderConfig) -> nn.Module:
@@ -74,6 +78,7 @@ class RBLNTransformerEncoder(RBLNModel):
                     if param_name in self._forward_signature.parameters:
                         kwargs[param_name] = False
 
+                # The 2D mask passes through: these encoders build their own 4D mask internally.
                 return self.model(*args, **kwargs)
 
         return TransformerEncoderWrapper(model, rbln_config).eval()
@@ -81,10 +86,10 @@ class RBLNTransformerEncoder(RBLNModel):
     @classmethod
     def _update_rbln_config(
         cls,
-        preprocessors: Optional[Union["AutoFeatureExtractor", "AutoProcessor", "AutoTokenizer"]] = None,
-        model: Optional["PreTrainedModel"] = None,
-        model_config: Optional["PretrainedConfig"] = None,
-        rbln_config: Optional[RBLNTransformerEncoderConfig] = None,
+        preprocessors: Sequence[Preprocessor] | None,
+        model: "PreTrainedModel",
+        model_config: "PretrainedConfig",
+        rbln_config: RBLNTransformerEncoderConfig,
     ) -> RBLNTransformerEncoderConfig:
         return cls.update_rbln_config_for_transformers_encoder(
             preprocessors=preprocessors,
@@ -96,10 +101,10 @@ class RBLNTransformerEncoder(RBLNModel):
     @classmethod
     def update_rbln_config_for_transformers_encoder(
         cls,
-        preprocessors: Optional[Union["AutoFeatureExtractor", "AutoProcessor", "AutoTokenizer"]] = None,
-        model: Optional["PreTrainedModel"] = None,
-        model_config: Optional["PretrainedConfig"] = None,
-        rbln_config: Optional[RBLNTransformerEncoderConfig] = None,
+        preprocessors: Sequence[Preprocessor] | None,
+        model: "PreTrainedModel",
+        model_config: "PretrainedConfig",
+        rbln_config: RBLNTransformerEncoderConfig,
     ) -> RBLNTransformerEncoderConfig:
         max_position_embeddings = getattr(model_config, "n_positions", None) or getattr(
             model_config, "max_position_embeddings", None
@@ -108,20 +113,28 @@ class RBLNTransformerEncoder(RBLNModel):
         if rbln_config.max_seq_len is None:
             rbln_config.max_seq_len = max_position_embeddings
             if rbln_config.max_seq_len is None:
-                for tokenizer in preprocessors:
+                for tokenizer in preprocessors or []:
                     if hasattr(tokenizer, "model_max_length"):
                         rbln_config.max_seq_len = tokenizer.model_max_length
                         break
                 if rbln_config.max_seq_len is None:
                     raise ValueError("`max_seq_len` should be specified!")
 
-        if max_position_embeddings is not None and rbln_config.max_seq_len > max_position_embeddings:
+        # `max_seq_len` may be a single value or a list of values (bucketing). Normalize to a
+        # sorted list of unique sequence lengths so that downstream logic is uniform.
+        max_seq_lens = (
+            [rbln_config.max_seq_len]
+            if isinstance(rbln_config.max_seq_len, int)
+            else sorted(set(rbln_config.max_seq_len))
+        )
+
+        if max_position_embeddings is not None and max(max_seq_lens) > max_position_embeddings:
             raise ValueError("`max_seq_len` should be less or equal than max_position_embeddings!")
 
         signature_params = inspect.signature(model.forward).parameters.keys()
 
         if rbln_config.model_input_names is None:
-            for tokenizer in preprocessors:
+            for tokenizer in preprocessors or []:
                 if hasattr(tokenizer, "model_input_names"):
                     rbln_config.model_input_names = [
                         name for name in signature_params if name in tokenizer.model_input_names
@@ -148,35 +161,71 @@ class RBLNTransformerEncoder(RBLNModel):
                 "This is an internal error. Please report it to the developers."
             )
 
-        if rbln_config.model_input_shapes is None:
-            input_info = [
-                (model_input_name, [rbln_config.batch_size, rbln_config.max_seq_len], cls.rbln_dtype)
+        # Build one input_info set per `max_seq_len` bucket. When more than one bucket is
+        # requested, `input_info` becomes a list of input_info sets so the compiled model
+        # exposes one executor per bucket and the runtime dispatches by input shape.
+        input_infos: list[TypeInputInfo] = [
+            [
+                (model_input_name, [rbln_config.batch_size, max_seq_len], cls.rbln_dtype)
                 for model_input_name in rbln_config.model_input_names
             ]
-        else:
-            input_info = [
-                (model_input_name, model_input_shape, cls.rbln_dtype)
-                for model_input_name, model_input_shape in zip(
-                    rbln_config.model_input_names, rbln_config.model_input_shapes, strict=False
-                )
-            ]
+            for max_seq_len in max_seq_lens
+        ]
+        input_info: TypeInputInfo | list[TypeInputInfo] = input_infos[0] if len(input_infos) == 1 else input_infos
 
         rbln_config.set_compile_cfgs([RBLNCompileConfig(input_info=input_info)])
         return rbln_config
 
+    def forward(self, *args: Any, return_dict: bool | None = None, **kwargs: Any) -> Any:
+        compile_cfg = self.rbln_config.compile_cfgs[0]
+        if not compile_cfg.is_multiple_input_info:
+            # No sequence-length bucketing: use the default single-shape path.
+            return super().forward(*args, return_dict=return_dict, **kwargs)
+
+        # Bucketing: pad inputs to the smallest `max_seq_len` bucket that fits, then slice outputs
+        # back to the original sequence length (`input_ids.shape[1]`).
+        buckets = (
+            [self.rbln_config.max_seq_len]
+            if isinstance(self.rbln_config.max_seq_len, int)
+            else sorted(set(self.rbln_config.max_seq_len or []))
+        )
+        input_ids = kwargs.get("input_ids")
+        if input_ids is None:
+            input_names = self.rbln_config.model_input_names or self.rbln_model_input_names
+            input_ids = args[input_names.index("input_ids")]
+        seq_len = input_ids.shape[1]
+        target = next((bucket for bucket in buckets if bucket >= seq_len), None)
+        if target is None:
+            raise ValueError(
+                f"Input sequence length ({seq_len}) exceeds the largest `max_seq_len` bucket ({buckets[-1]})."
+            )
+
+        def pad(t):
+            return torch.nn.functional.pad(t, (0, target - seq_len)) if isinstance(t, torch.Tensor) else t
+
+        def unpad(t):
+            return t[:, :seq_len] if isinstance(t, torch.Tensor) and t.dim() >= 2 and t.shape[1] == target else t
+
+        output = self.model[0](*(pad(a) for a in args), **{k: pad(v) for k, v in kwargs.items()})
+        output = type(output)(map(unpad, output)) if isinstance(output, (tuple, list)) else unpad(output)
+
+        return_dict = return_dict if return_dict is not None else self.config.return_dict
+        return self._prepare_output(output, return_dict)
+
 
 class RBLNImageModel(RBLNModel):
-    auto_model_class = AutoModel
+    auto_model_class: ClassVar[type[Any]] = AutoModel
     main_input_name = "pixel_values"
     output_class = BaseModelOutput
+    rbln_config: RBLNImageModelConfig
 
     @classmethod
     def _update_rbln_config(
         cls,
-        preprocessors: Optional[Union["AutoFeatureExtractor", "AutoProcessor", "AutoTokenizer"]] = None,
-        model: Optional["PreTrainedModel"] = None,
-        model_config: Optional["PretrainedConfig"] = None,
-        rbln_config: Optional[RBLNImageModelConfig] = None,
+        preprocessors: Sequence[Preprocessor] | None,
+        model: "PreTrainedModel",
+        model_config: "PretrainedConfig",
+        rbln_config: RBLNImageModelConfig,
     ) -> RBLNImageModelConfig:
         return cls.update_rbln_config_for_image_model(
             preprocessors=preprocessors,
@@ -188,19 +237,19 @@ class RBLNImageModel(RBLNModel):
     @classmethod
     def update_rbln_config_for_image_model(
         cls,
-        preprocessors: Optional[Union["AutoFeatureExtractor", "AutoProcessor", "AutoTokenizer"]] = None,
-        model: Optional["PreTrainedModel"] = None,
-        model_config: Optional["PretrainedConfig"] = None,
-        rbln_config: Optional[RBLNImageModelConfig] = None,
+        preprocessors: Sequence[Preprocessor] | None,
+        model: "PreTrainedModel",
+        model_config: "PretrainedConfig",
+        rbln_config: RBLNImageModelConfig,
     ) -> RBLNImageModelConfig:
         if rbln_config.image_size is None:
-            for processor in preprocessors:
+            for processor in preprocessors or []:
                 if hasattr(processor, "size"):
-                    if all(required_key in processor.size.keys() for required_key in ["height", "width"]):
+                    if all(required_key in processor.size for required_key in ["height", "width"]):
                         rbln_config.image_size = (processor.size["height"], processor.size["width"])
-                    elif "shortest_edge" in processor.size.keys():
+                    elif "shortest_edge" in processor.size:
                         rbln_config.image_size = (processor.size["shortest_edge"], processor.size["shortest_edge"])
-                    elif "longest_edge" in processor.size.keys():
+                    elif "longest_edge" in processor.size:
                         rbln_config.image_size = (processor.size["longest_edge"], processor.size["longest_edge"])
                     break
 
@@ -214,7 +263,7 @@ class RBLNImageModel(RBLNModel):
             (
                 cls.main_input_name,
                 [rbln_config.batch_size, 3, rbln_config.image_height, rbln_config.image_width],
-                "float32",
+                rbln_config.dtype,
             )
         ]
 
@@ -266,7 +315,7 @@ class RBLNModelForDepthEstimation(RBLNImageModel):
     auto_model_class = AutoModelForDepthEstimation
 
     @classmethod
-    def _wrap_model_if_needed(cls, model: "PreTrainedModel", rbln_config: RBLNImageModelConfig):
+    def _wrap_model_if_needed(cls, model: "PreTrainedModel", rbln_config: RBLNImageModelConfig) -> nn.Module:
         class ImageModelWrapper(nn.Module):
             def __init__(self, model: "PreTrainedModel", rbln_config: RBLNImageModelConfig):
                 super().__init__()

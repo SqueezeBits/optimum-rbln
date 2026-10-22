@@ -12,11 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
-from typing import TYPE_CHECKING, Optional, Tuple, Union
+from typing import TYPE_CHECKING
 
 import torch
-import torch.nn as nn
+from torch import nn
 from transformers import PreTrainedModel
 
 from ..decoderonly.decoderonly_architecture import (
@@ -24,7 +23,7 @@ from ..decoderonly.decoderonly_architecture import (
     DecoderOnlyForCausalLM,
     DecoderOnlyModel,
     DecoderOnlyWrapper,
-    apply_rotary_pos_emb,
+    rotate_half,
     slice_and_unsqueeze_cos_sin,
 )
 from .configuration_qwen3_vl import RBLNQwen3VLVisionModelConfig
@@ -32,6 +31,16 @@ from .configuration_qwen3_vl import RBLNQwen3VLVisionModelConfig
 
 if TYPE_CHECKING:
     from .configuration_qwen3_vl import RBLNQwen3VLForConditionalGenerationConfig
+
+
+def apply_rotary_pos_emb_vision(q, k, cos, sin):
+    # Mirrors HF `apply_rotary_pos_emb_vision`: rotate in fp32 and round once.
+    orig_q_dtype, orig_k_dtype = q.dtype, k.dtype
+    q, k = q.float(), k.float()
+    cos, sin = cos.float(), sin.float()
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed.to(orig_q_dtype), k_embed.to(orig_k_dtype)
 
 
 class Qwen3VLVisionModelWrapper(nn.Module):
@@ -48,10 +57,7 @@ class Qwen3VLVisionModelWrapper(nn.Module):
         blocks: torch.nn.ModuleList,
         rbln_config: RBLNQwen3VLVisionModelConfig,
     ):
-        wrapped_blocks = []
-        for block in blocks:
-            wrapped_blocks.append(Qwen3VLVisionBlock(block, rbln_config))
-        return nn.ModuleList(wrapped_blocks)
+        return nn.ModuleList([Qwen3VLVisionBlock(block, rbln_config) for block in blocks])
 
     def forward(
         self,
@@ -92,7 +98,7 @@ class Qwen3VLVisionBlock(torch.nn.Module):
         self,
         hidden_states: torch.Tensor,
         attn_mask: torch.Tensor,
-        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         hidden_states = hidden_states + self.attn(
             self.norm1(hidden_states),
@@ -112,13 +118,13 @@ class Qwen3VLVisionAttention(nn.Module):
         self.head_dim = getattr(model, "head_dim", model.proj.in_features // model.num_heads)
         self.qkv = model.qkv
         self.proj = model.proj
-        self.scale = torch.tensor(1 / math.sqrt(self.head_dim), dtype=rbln_config.dtype)
+        self.scale = self.head_dim**-0.5
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         attn_mask: torch.Tensor,
-        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         seq_length = hidden_states.shape[0]
         hidden_states = hidden_states.unsqueeze(0)
@@ -126,7 +132,7 @@ class Qwen3VLVisionAttention(nn.Module):
             self.qkv(hidden_states).reshape(1, seq_length, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4).unbind(0)
         )
         cos, sin = position_embeddings
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
         attn_output = nn.functional.scaled_dot_product_attention(
             q,
             k,
@@ -134,7 +140,7 @@ class Qwen3VLVisionAttention(nn.Module):
             attn_mask=attn_mask,
             dropout_p=0.0,
             is_causal=False,
-            scale=self.scale.item(),
+            scale=self.scale,
         )
         attn_output = attn_output.transpose(1, 2)
         attn_output = attn_output.reshape(1, seq_length, -1)
@@ -169,18 +175,10 @@ class Qwen3VL_LanguageModelWrapper(DecoderOnlyWrapper):
         model.config = original_config
 
     def get_decoder_layers(self, model: PreTrainedModel):
-        if hasattr(model, "language_model"):
-            return model.language_model.layers
-        elif hasattr(model, "model"):
-            return model.model.layers
-        return model.layers
+        return model.get_decoder().layers
 
     def get_model_layer(self, model: PreTrainedModel):
-        if hasattr(model, "language_model"):
-            return model.language_model
-        elif hasattr(model, "model"):
-            return model.model
-        return model
+        return model.get_decoder()
 
     def get_rbln_attn_class(self):
         return Qwen3VLAttention
@@ -310,20 +308,20 @@ class Qwen3VL_LanguageModelWrapper(DecoderOnlyWrapper):
 class Qwen3VLDecoderOnlyForCausalLM(DecoderOnlyForCausalLM):
     def forward(
         self,
-        input_ids: torch.Tensor = None,
-        inputs_embeds: torch.Tensor = None,
-        attention_mask: torch.Tensor = None,
-        cache_position: torch.Tensor = None,
-        position_ids: torch.Tensor = None,
-        query_position: torch.Tensor = None,
-        past_key_values: Tuple[Tuple[torch.Tensor]] = None,
-        rotary_emb: nn.Module = None,
-        global_block_tables: Optional[torch.Tensor] = None,
-        local_block_tables: Optional[torch.Tensor] = None,
-        lora_int_id: Optional[torch.Tensor] = None,
-        output_hidden_states: Optional[bool] = None,
-        visual_pos_mask: Optional[torch.Tensor] = None,
-        deepstack_visual_embeds: Optional[torch.Tensor] = None,
+        input_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        cache_position: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        query_position: torch.Tensor | None = None,
+        past_key_values: tuple[tuple[torch.Tensor]] | None = None,
+        rotary_emb: nn.Module | None = None,
+        global_block_tables: torch.Tensor | None = None,
+        local_block_tables: torch.Tensor | None = None,
+        lora_int_id: torch.Tensor | None = None,
+        output_hidden_states: bool | None = None,
+        visual_pos_mask: torch.Tensor | None = None,
+        deepstack_visual_embeds: torch.Tensor | None = None,
     ):
         hidden_states, all_hidden_states = self.model(
             input_ids=input_ids,
@@ -372,20 +370,20 @@ class Qwen3VLDecoderOnlyModel(DecoderOnlyModel):
 
     def forward(
         self,
-        input_ids: torch.Tensor = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        attention_mask: torch.Tensor = None,
-        cache_position: torch.Tensor = None,
-        position_ids: torch.Tensor = None,
-        query_position: torch.Tensor = None,
-        past_key_values: Tuple[Tuple[torch.Tensor]] = None,
-        rotary_emb: Optional[Union[nn.Module, torch.Tensor]] = None,
-        global_block_tables: Optional[torch.Tensor] = None,
-        local_block_tables: Optional[torch.Tensor] = None,
-        lora_int_id: Optional[torch.Tensor] = None,
-        output_hidden_states: Optional[bool] = None,
-        visual_pos_mask: Optional[torch.Tensor] = None,
-        deepstack_visual_embeds: Optional[torch.Tensor] = None,
+        input_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        cache_position: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        query_position: torch.Tensor | None = None,
+        past_key_values: tuple[tuple[torch.Tensor]] | None = None,
+        rotary_emb: nn.Module | torch.Tensor | None = None,
+        global_block_tables: torch.Tensor | None = None,
+        local_block_tables: torch.Tensor | None = None,
+        lora_int_id: torch.Tensor | None = None,
+        output_hidden_states: bool | None = None,
+        visual_pos_mask: torch.Tensor | None = None,
+        deepstack_visual_embeds: torch.Tensor | None = None,
     ):
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
@@ -429,7 +427,7 @@ class Qwen3VLDecoderOnlyModel(DecoderOnlyModel):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            is_sliding = True if layer_idx in self.sliding_window_layers else False
+            is_sliding = layer_idx in self.sliding_window_layers
             is_sliding_decode = is_sliding and self.phase == "decode"
             hidden_states = layer(
                 hidden_states=hidden_states,

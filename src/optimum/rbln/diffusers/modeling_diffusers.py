@@ -14,10 +14,12 @@
 
 import copy
 import importlib
+from collections.abc import Mapping
 from os import PathLike
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type, Union
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import torch
+from typing_extensions import Self
 
 from ..configuration_utils import ContextRblnConfig, RBLNModelConfig, get_rbln_config_class
 from ..modeling import RBLNModel
@@ -29,7 +31,15 @@ from ..utils.model_utils import get_rbln_model_cls
 logger = get_logger(__name__)
 
 if TYPE_CHECKING:
-    from diffusers.pipelines.controlnet.multicontrolnet import MultiControlNetModel
+    from diffusers.models.controlnets.multicontrolnet import MultiControlNetModel
+    from diffusers.models.modeling_utils import ModelMixin
+    from diffusers.pipelines.pipeline_utils import DiffusionPipeline
+
+    from .models import RBLNMultiControlNetModel
+
+    _PipelineBase = DiffusionPipeline
+else:
+    _PipelineBase = object
 
 
 class RBLNDiffusionMixinConfig(RBLNModelConfig):
@@ -37,14 +47,16 @@ class RBLNDiffusionMixinConfig(RBLNModelConfig):
     Configuration class for RBLN diffusion pipelines.
     """
 
-    pass
 
-
-class RBLNDiffusionMixin:
+class RBLNDiffusionMixin(_PipelineBase):
     """
     RBLNDiffusionMixin provides essential functionalities for compiling Stable Diffusion pipeline components to run on RBLN NPUs.
     This mixin class serves as a base for implementing RBLN-compatible Stable Diffusion pipelines. It contains shared logic for
     handling the core components of Stable Diffusion.
+
+    The class has no base class at runtime. For type checking only it declares `DiffusionPipeline` as its base, because
+    every concrete pipeline mixes it in next to a `DiffusionPipeline` subclass and that is what `self.load_config`,
+    `self.vae` and the `super()` calls resolve to.
 
     To use this mixin:
 
@@ -70,18 +82,26 @@ class RBLNDiffusionMixin:
           as keys in rbln_config
     """
 
-    _connected_classes = {}
-    _submodules = []
-    _optional_submodules = []
-    _prefix = {}
+    _connected_classes: ClassVar[dict[str, type["RBLNDiffusionMixin"]]] = {}
+    _submodules: ClassVar[list[str]] = []
+    _optional_submodules: ClassVar[list[str]] = []
+    # Whether this pipeline acts on a VAE's `force_upcast` by moving it to float32 around encode/decode.
+    # The config alone cannot tell: `force_upcast` is the `AutoencoderKL` constructor default, so nearly
+    # every VAE carries it while only some pipelines read it -- SD3 declares it and still ignores it. Since
+    # a compiled graph cannot be moved at runtime, the pipelines that do read it get a float32 VAE at
+    # compile time, and the rest keep the checkpoint dtype, as upstream runs them.
+    _upcasts_vae: ClassVar[bool] = False
+    _prefix: ClassVar[dict[str, str]] = {}
+    _rbln_config_class: ClassVar[type[RBLNModelConfig] | None] = None
+    _hf_class: ClassVar[type[Any] | None] = None
 
     @staticmethod
     def _maybe_apply_and_fuse_lora(
-        model: torch.nn.Module,
-        lora_ids: Optional[Union[str, List[str]]] = None,
-        lora_weights_names: Optional[Union[str, List[str]]] = None,
-        lora_scales: Optional[Union[float, List[float]]] = None,
-    ) -> torch.nn.Module:
+        model: Any,
+        lora_ids: str | list[str] | None = None,
+        lora_weights_names: str | list[str] | None = None,
+        lora_scales: float | list[float] | None = None,
+    ) -> Any:
         lora_ids = [lora_ids] if isinstance(lora_ids, str) else lora_ids
         lora_weights_names = [lora_weights_names] if isinstance(lora_weights_names, str) else lora_weights_names
         lora_scales = [lora_scales] if isinstance(lora_scales, float) else lora_scales
@@ -116,34 +136,36 @@ class RBLNDiffusionMixin:
         return model
 
     @classmethod
-    def get_rbln_config_class(cls) -> Type[RBLNModelConfig]:
+    def get_rbln_config_class(cls) -> type[RBLNModelConfig]:
         # Lazily loads and caches the corresponding RBLN model config class.
-        if "_rbln_config_class" not in cls.__dict__ or cls._rbln_config_class is None:
-            rbln_config_class_name = cls.__name__ + "Config"
-            cls._rbln_config_class = get_rbln_config_class(rbln_config_class_name)
-        return cls._rbln_config_class
+        rbln_config_class: type[RBLNModelConfig] | None = cls.__dict__.get("_rbln_config_class")
+        if rbln_config_class is None:
+            rbln_config_class = get_rbln_config_class(cls.__name__ + "Config")
+            cls._rbln_config_class = rbln_config_class
+        return rbln_config_class
 
     @classmethod
-    def get_hf_class(cls):
-        if "_hf_class" not in cls.__dict__ or cls._hf_class is None:
-            hf_cls_name = cls.__name__[4:]
+    def get_hf_class(cls) -> type[Any] | None:
+        hf_class: type[Any] | None = cls.__dict__.get("_hf_class")
+        if hf_class is None:
             library = importlib.import_module("diffusers")
-            cls._hf_class = getattr(library, hf_cls_name, None)
-        return cls._hf_class
+            hf_class = getattr(library, cls.__name__[4:], None)
+            cls._hf_class = hf_class
+        return hf_class
 
     @classmethod
-    def from_pretrained(
+    def from_pretrained(  # type: ignore[override]
         cls,
         model_id: str,
         *,
-        export: bool = None,
-        model_save_dir: Optional[PathLike] = None,
-        rbln_config: Optional[Dict[str, Any]] = None,
-        lora_ids: Optional[Union[str, List[str]]] = None,
-        lora_weights_names: Optional[Union[str, List[str]]] = None,
-        lora_scales: Optional[Union[float, List[float]]] = None,
+        export: bool | None = None,
+        model_save_dir: str | PathLike[str] | None = None,
+        rbln_config: dict[str, Any] | RBLNModelConfig | None = None,
+        lora_ids: str | list[str] | None = None,
+        lora_weights_names: str | list[str] | None = None,
+        lora_scales: float | list[float] | None = None,
         **kwargs: Any,
-    ) -> "RBLNDiffusionMixin":
+    ) -> Self:
         """
         Load a pretrained diffusion pipeline from a model checkpoint, with optional compilation for RBLN NPUs.
 
@@ -211,7 +233,7 @@ class RBLNDiffusionMixin:
 
         else:
             # raise error if any of submodules are torch module.
-            model_index_config = cls.load_config(pretrained_model_name_or_path=model_id)
+            model_index_config = cast(dict[str, Any], cls.load_config(pretrained_model_name_or_path=model_id))
             for submodule_name in cls._submodules + cls._optional_submodules:
                 passed_submodule = kwargs.get(submodule_name, None)
 
@@ -227,18 +249,26 @@ class RBLNDiffusionMixin:
 
                     submodule_cls = get_rbln_model_cls(class_name)
                     submodule_config = getattr(rbln_config, submodule_name)
+                    if isinstance(submodule_config, RBLNModelConfig):
+                        # This submodule config is a default-filled partial, not the complete
+                        # config recorded in the artifact.
+                        submodule_config = submodule_config.get_load_overrides()
                     submodule = submodule_cls.from_pretrained(
                         model_id, export=False, subfolder=submodule_name, rbln_config=submodule_config
                     )
 
-                else:
-                    if passed_submodule.__class__.__name__.startswith("RBLN"):
-                        submodule = passed_submodule
+                elif passed_submodule.__class__.__name__.startswith("RBLN"):
+                    submodule = passed_submodule
 
-                    elif isinstance(passed_submodule, torch.nn.Module):
-                        raise AssertionError(
-                            f"{submodule_name} is not compiled torch module. If you want to compile, set `export=True`."
-                        )
+                elif isinstance(passed_submodule, torch.nn.Module):
+                    raise AssertionError(
+                        f"{submodule_name} is not compiled torch module. If you want to compile, set `export=True`."
+                    )
+
+                else:
+                    # Not an RBLN model and not a torch module (e.g. a stand-in safety
+                    # checker): keep it, instead of leaking the previous loop's submodule.
+                    submodule = passed_submodule
 
                 kwargs[submodule_name] = submodule
 
@@ -270,17 +300,17 @@ class RBLNDiffusionMixin:
     @classmethod
     def _compile_pipelines(
         cls,
-        model: torch.nn.Module,
-        passed_submodules: Dict[str, RBLNModel],
-        model_save_dir: Optional[PathLike],
-        rbln_config: "RBLNDiffusionMixinConfig",
-    ) -> Dict[str, RBLNModel]:
-        compiled_submodules = {}
+        model: "DiffusionPipeline",
+        passed_submodules: Mapping[str, RBLNModel | None],
+        model_save_dir: str | PathLike[str] | None,
+        rbln_config: RBLNModelConfig,
+    ) -> dict[str, RBLNModel]:
+        compiled_submodules: dict[str, RBLNModel] = {}
         for connected_pipe_name, connected_pipe_cls in cls._connected_classes.items():
-            connected_pipe_submodules = {}
+            connected_pipe_submodules: dict[str, RBLNModel | None] = {}
             prefix = cls._prefix.get(connected_pipe_name, "")
             for submodule_name in connected_pipe_cls._submodules:
-                connected_pipe_submodules[submodule_name] = passed_submodules.get(prefix + submodule_name, None)
+                connected_pipe_submodules[submodule_name] = passed_submodules.get(prefix + submodule_name)
             connected_pipe = getattr(model, connected_pipe_name)
             connected_pipe_compiled_submodules = connected_pipe_cls._compile_submodules(
                 connected_pipe,
@@ -294,15 +324,48 @@ class RBLNDiffusionMixin:
         return compiled_submodules
 
     @classmethod
+    def _warn_on_mixed_dtypes(
+        cls, model: "DiffusionPipeline", passed_submodules: Mapping[str, RBLNModel | None]
+    ) -> None:
+        """
+        Point out submodules that disagree on dtype, before any of them is compiled.
+
+        Each submodule is compiled at the dtype its own weights carry, and a compiled graph declares one
+        exact dtype per input -- the runtime does not promote. So a pipeline whose submodules disagree
+        compiles cleanly and may then fail on its first call, wherever one hands a tensor to the next. The
+        usual cause is a submodule loaded without the dtype the rest of the pipeline got: `torch_dtype`
+        left unset makes diffusers fall back to float32 while transformers adopts the checkpoint's own
+        dtype. Mixing them can also be deliberate, so this only warns.
+        """
+        dtypes = {}
+        for name in cls._submodules:
+            submodule = passed_submodules.get(name) or getattr(model, name, None)
+            if isinstance(submodule, torch.nn.Module) and not isinstance(submodule, RBLNModel):
+                dtype = getattr(submodule, "dtype", None)
+                if dtype is not None:
+                    dtypes[name] = dtype
+
+        if len(set(dtypes.values())) > 1:
+            listed = ", ".join(f"{name}={dtype}" for name, dtype in dtypes.items())
+            logger.warning(
+                f"The submodules of this pipeline were loaded at more than one dtype ({listed}). Each is "
+                "compiled at the dtype its own weights carry, and the runtime rejects a dtype a graph was "
+                "not compiled for, so passing a tensor from one submodule to another may fail. Pass "
+                "`torch_dtype=` to `from_pretrained` to load the whole pipeline at one dtype, unless the "
+                "mix is intended."
+            )
+
+    @classmethod
     def _compile_submodules(
         cls,
-        model: torch.nn.Module,
-        passed_submodules: Dict[str, RBLNModel],
-        model_save_dir: Optional[PathLike],
-        rbln_config: RBLNDiffusionMixinConfig,
-        prefix: Optional[str] = "",
-    ) -> Dict[str, RBLNModel]:
-        compiled_submodules = {}
+        model: "DiffusionPipeline",
+        passed_submodules: Mapping[str, RBLNModel | None],
+        model_save_dir: str | PathLike[str] | None,
+        rbln_config: RBLNModelConfig,
+        prefix: str = "",
+    ) -> dict[str, RBLNModel]:
+        compiled_submodules: dict[str, RBLNModel] = {}
+        cls._warn_on_mixed_dtypes(model, passed_submodules)
 
         for submodule_name in cls._submodules:
             submodule = passed_submodules.get(submodule_name) or getattr(model, submodule_name, None)
@@ -310,7 +373,7 @@ class RBLNDiffusionMixin:
             if getattr(rbln_config, submodule_name, None) is None:
                 raise ValueError(f"RBLN config for submodule {submodule_name} is not provided.")
 
-            submodule_rbln_cls: Type[RBLNModel] = getattr(rbln_config, submodule_name).rbln_model_cls
+            submodule_rbln_cls: type[RBLNModel] = getattr(rbln_config, submodule_name).rbln_model_cls
             rbln_config = submodule_rbln_cls.update_rbln_config_using_pipe(model, rbln_config, submodule_name)
 
             if submodule is None:
@@ -326,8 +389,11 @@ class RBLNDiffusionMixin:
                 )
             elif isinstance(submodule, torch.nn.Module):
                 subfolder = prefix + submodule_name
+                if cls._upcasts_vae and submodule_name == "vae" and getattr(submodule.config, "force_upcast", False):
+                    submodule = submodule.to(torch.float32)
+
                 submodule = submodule_rbln_cls.from_model(
-                    model=submodule,
+                    model=cast("ModelMixin", submodule),
                     subfolder=subfolder,
                     model_save_dir=model_save_dir,
                     rbln_config=getattr(rbln_config, submodule_name),
@@ -342,20 +408,20 @@ class RBLNDiffusionMixin:
     def _compile_multicontrolnet(
         cls,
         controlnets: "MultiControlNetModel",
-        model_save_dir: Optional[PathLike],
+        model_save_dir: str | PathLike[str] | None,
         controlnet_rbln_config: RBLNModelConfig,
-        prefix: Optional[str] = "",
-    ):
+        prefix: str = "",
+    ) -> "RBLNMultiControlNetModel":
         # Compile multiple ControlNet models for a MultiControlNet setup
-        from .models.controlnet import RBLNControlNetModel
-        from .pipelines.controlnet import RBLNMultiControlNetModel
+        from .models.controlnets.controlnet import RBLNControlNetModel
+        from .models.controlnets.multicontrolnet import RBLNMultiControlNetModel
 
         compiled_controlnets = []
         for i, controlnet in enumerate(controlnets.nets):
             _controlnet_rbln_config = copy.deepcopy(controlnet_rbln_config)
             compiled_controlnets.append(
                 RBLNControlNetModel.from_model(
-                    model=controlnet,
+                    model=cast("ModelMixin", controlnet),
                     subfolder=f"{prefix}controlnet" if i == 0 else f"{prefix}controlnet_{i}",
                     model_save_dir=model_save_dir,
                     rbln_config=_controlnet_rbln_config,
@@ -450,4 +516,9 @@ class RBLNDiffusionMixin:
     @remove_compile_time_kwargs
     def __call__(self, *args, **kwargs):
         kwargs = self.handle_additional_kwargs(**kwargs)
-        return super().__call__(*args, **kwargs)
+        return super().__call__(*args, **kwargs)  # type: ignore[misc]
+
+
+__all__ = [
+    "RBLNDiffusionMixin",
+]

@@ -1,22 +1,146 @@
+import gc
 import inspect
 import os
 import random
 import shutil
 import tempfile
 import unittest
+from collections.abc import Iterable
+from contextlib import nullcontext as does_not_raise
 from enum import Enum
-from typing import Iterable
+from unittest.mock import patch
 
+import pytest
 import transformers
 from diffusers import DiffusionPipeline
-from transformers import AutoConfig, CLIPConfig
+from huggingface_hub import HfApi
+from transformers import AutoConfig
 
 from optimum.rbln import __version__
 from optimum.rbln.configuration_utils import ContextRblnConfig
+from optimum.rbln.utils.deprecation import deprecate_method
 
 
 def test_version_is_str():
     assert isinstance(__version__, str)
+
+
+def test_bare_pretrained_config_resolves_model_class():
+    # vLLM's mistral-format parser (params.json) yields a base PretrainedConfig
+    # with model_type "transformer"; only `architectures` identifies the model.
+    from transformers import MistralConfig, PretrainedConfig
+
+    from optimum.rbln import RBLNAutoModelForCausalLM, RBLNMistralForCausalLM
+
+    config_dict = MistralConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        vocab_size=128,
+        architectures=["MistralForCausalLM"],
+    ).to_dict()
+    config_dict["model_type"] = "transformer"
+    bare_config = PretrainedConfig.from_dict(config_dict)
+
+    rbln_cls = RBLNAutoModelForCausalLM.get_rbln_cls("dummy/mistral", export=True, config=bare_config)
+    assert rbln_cls is RBLNMistralForCausalLM
+
+
+def _save_config_with_stale_remote_code(path):
+    # A model type transformers implements, with an `auto_map` pointing at remote code that no longer imports
+    # (like Phi-4-mini's modeling_phi3.py, which imports the removed `transformers.utils.LossKwargs`).
+    from transformers import LlamaConfig
+
+    config = LlamaConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        vocab_size=128,
+        architectures=["LlamaForCausalLM"],
+    )
+    config.auto_map = {"AutoModelForCausalLM": "modeling_stale.LlamaForCausalLM"}
+    config.save_pretrained(path)
+    (path / "modeling_stale.py").write_text("from transformers.utils import NameRemovedFromTransformers\n")
+
+
+def test_auto_class_prefers_builtin_class_over_remote_code(tmp_path):
+    from optimum.rbln import RBLNAutoModelForCausalLM, RBLNLlamaForCausalLM
+
+    _save_config_with_stale_remote_code(tmp_path)
+
+    assert RBLNAutoModelForCausalLM.get_rbln_cls(str(tmp_path), export=True) is RBLNLlamaForCausalLM
+    assert (
+        RBLNAutoModelForCausalLM.get_rbln_cls(str(tmp_path), export=True, trust_remote_code=False)
+        is RBLNLlamaForCausalLM
+    )
+
+
+def test_auto_class_uses_remote_code_when_trusted(tmp_path):
+    from optimum.rbln import RBLNAutoModelForCausalLM
+
+    _save_config_with_stale_remote_code(tmp_path)
+
+    with pytest.raises(ImportError):
+        RBLNAutoModelForCausalLM.get_rbln_cls(str(tmp_path), export=True, trust_remote_code=True)
+
+
+def test_upgrade_bare_config_recovers_concrete_class():
+    from transformers import MistralConfig, PretrainedConfig
+
+    from optimum.rbln.transformers.models.auto.auto_factory import _upgrade_bare_config
+
+    reference = MistralConfig(
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        vocab_size=128,
+        architectures=["MistralForCausalLM"],
+    )
+    config_dict = reference.to_dict()
+    config_dict["model_type"] = "transformer"
+    upgraded = _upgrade_bare_config(PretrainedConfig.from_dict(config_dict))
+
+    assert type(upgraded) is MistralConfig
+    assert upgraded.model_type == "mistral"
+    assert upgraded.to_dict() == reference.to_dict()
+
+    # Unresolvable architectures are left untouched.
+    unknown = PretrainedConfig.from_dict({"architectures": ["NoSuchModel"]})
+    assert _upgrade_bare_config(unknown) is unknown
+    no_arch = PretrainedConfig.from_dict({})
+    assert _upgrade_bare_config(no_arch) is no_arch
+
+
+@pytest.mark.parametrize(
+    ("current_version", "expect_raise"),
+    [
+        pytest.param("1.9.5", False, id="below"),
+        pytest.param("1.9.99.post1", False, id="below-post"),
+        pytest.param("1.10.0.dev0", True, id="dev"),
+        pytest.param("1.10.0a1", True, id="alpha"),
+        pytest.param("1.10.0b2", True, id="beta"),
+        pytest.param("1.10.0rc1", True, id="rc"),
+        pytest.param("1.10.0", True, id="final"),
+        pytest.param("1.10.0.post1", True, id="post"),
+        pytest.param("1.10.1", True, id="patch-above"),
+    ],
+)
+def test_deprecate_method_raises_at_or_past_cutoff(current_version, expect_raise):
+    expectation = pytest.raises(ValueError, match="deprecated") if expect_raise else does_not_raise()
+
+    with patch("optimum.rbln.utils.deprecation.__version__", current_version):
+
+        @deprecate_method(version="1.10.0", new_method="from_pretrained")
+        def stub():
+            pass
+
+    with expectation:
+        stub()
 
 
 DUMMY_DEVICE_CODE = -1
@@ -67,8 +191,8 @@ class BaseHubTest:
                 HF_AUTH_TOKEN = os.environ.get("HF_AUTH_TOKEN", None)
                 HF_USER_ID = os.environ.get("HF_USER_ID", None)
 
-                self.assertTrue(HF_AUTH_TOKEN)
-                self.assertTrue(HF_USER_ID)
+                assert HF_AUTH_TOKEN
+                assert HF_USER_ID
                 TOKEN_KEY = "token"
                 REPO_KEY = "repo_id"
 
@@ -77,34 +201,26 @@ class BaseHubTest:
                 else:
                     self.model.config.from_local = remote_hash
 
+                repo_id = f"{HF_USER_ID}/{self.get_hf_remote_dir()}"
                 self.model.save_pretrained(
                     tmpdirname,
                     push_to_hub=True,
                     private=True,
                     **{
                         TOKEN_KEY: HF_AUTH_TOKEN,
-                        REPO_KEY: f"{HF_USER_ID}/{self.get_hf_remote_dir()}",
+                        REPO_KEY: repo_id,
                     },
                 )
 
-                # If our tests were moved to a public rather than a private repository,
-                # this logic could be as simple as downloading the config file directly
-                # and comparing it.
-                if self.is_diffuser():
-                    cfg = CLIPConfig.from_pretrained(
-                        f"{HF_USER_ID}/{self.get_hf_remote_dir()}",
-                        subfolder="text_encoder",
-                        private=True,
-                        **{TOKEN_KEY: HF_AUTH_TOKEN},
-                    )
-                else:
-                    cfg = AutoConfig.from_pretrained(
-                        f"{HF_USER_ID}/{self.get_hf_remote_dir()}",
-                        private=True,
-                        **{TOKEN_KEY: HF_AUTH_TOKEN},
-                    )
+                revision = HfApi(token=HF_AUTH_TOKEN).repo_info(repo_id).sha
+                cfg = AutoConfig.from_pretrained(
+                    repo_id,
+                    subfolder="text_encoder" if self.is_diffuser() else "",
+                    revision=revision,
+                    **{TOKEN_KEY: HF_AUTH_TOKEN},
+                )
 
-                self.assertEqual(remote_hash, cfg.from_local)
+                assert remote_hash == cfg.from_local
 
         @require_hf_token
         @require_hf_user_id
@@ -162,8 +278,11 @@ class BaseTest:
                     compiled_model_path = os.path.join(REUSE_ARTIFACTS_PATH, cls.get_rbln_local_dir())
                     if os.path.exists(compiled_model_path):
                         with ContextRblnConfig(device=DUMMY_DEVICE_CODE):
-                            cls.model = cls.RBLN_CLASS.from_pretrained(compiled_model_path)
-                if not hasattr(cls, "model"):
+                            cls.model = cls.RBLN_CLASS.from_pretrained(compiled_model_path, **cls.HF_CONFIG_KWARGS)
+                # Check cls.__dict__, not hasattr: hasattr also finds a parent test class's
+                # already-loaded model, silently running this class against a model compiled
+                # with the parent's (possibly incompatible) rbln_config.
+                if "model" not in cls.__dict__:
                     raise unittest.SkipTest("Compiled model not found")
 
         @classmethod
@@ -186,6 +305,12 @@ class BaseTest:
 
         @classmethod
         def tearDownClass(cls):
+            # One process runs every class in turn, so release this class's runtimes
+            # before the next class loads its own; on the dummy device they all live
+            # in host memory and the BC llm run hit SYS_ENOMEM part-way through.
+            if "model" in cls.__dict__:
+                del cls.model
+                gc.collect()
             if os.path.exists(cls.get_rbln_local_dir()):
                 shutil.rmtree(cls.get_rbln_local_dir())
 
@@ -206,7 +331,7 @@ class BaseTest:
                     )
 
         def test_model_save_dir(self):
-            self.assertTrue(os.path.exists(self.get_rbln_local_dir()), "model_save_dir does not work.")
+            assert os.path.exists(self.get_rbln_local_dir()), "model_save_dir does not work."
 
         def get_inputs(self):
             return self.GENERATION_KWARGS
@@ -218,12 +343,11 @@ class BaseTest:
             inputs = self.get_inputs()
             if self.is_diffuser():
                 output = self.model(**inputs)[0]
+            elif self.model.can_generate():
+                output = self.model.generate(**inputs)
             else:
-                if self.model.can_generate():
-                    output = self.model.generate(**inputs)
-                else:
-                    # encoder-only, resnet, etc..
-                    output = self.model(**inputs)[0]
+                # encoder-only, resnet, etc..
+                output = self.model(**inputs)[0]
 
             output = self.postprocess(inputs, output)
             REUSE_ARTIFACTS_PATH = os.environ.get("REUSE_ARTIFACTS_PATH", None)
@@ -232,22 +356,18 @@ class BaseTest:
 
                 if isinstance(self.EXPECTED_OUTPUT, str):
                     similarity = jaccard_similarity(output, self.EXPECTED_OUTPUT)
-                    self.assertGreater(
-                        similarity, 0.9, msg=f"self.EXPECTED_OUTPUT: {self.EXPECTED_OUTPUT}, output: {output}"
-                    )
+                    assert similarity > 0.9, f"self.EXPECTED_OUTPUT: {self.EXPECTED_OUTPUT}, output: {output}"
                 else:
                     for o, e_o in zip(output, self.EXPECTED_OUTPUT, strict=False):
                         similarity = jaccard_similarity(o, e_o)
-                        self.assertGreater(
-                            similarity, 0.9, msg=f"self.EXPECTED_OUTPUT: {self.EXPECTED_OUTPUT}, output: {output}"
-                        )
+                        assert similarity > 0.9, f"self.EXPECTED_OUTPUT: {self.EXPECTED_OUTPUT}, output: {output}"
 
         def _inner_test_save_load(self, tmpdir):
             with ContextRblnConfig(create_runtimes=False):
                 with self.subTest():
                     self.model.save_pretrained(tmpdir)
                     config_path = os.path.join(tmpdir, self.RBLN_CLASS.config_name)
-                    self.assertTrue(os.path.exists(config_path), "save_pretrained does not work.")
+                    assert os.path.exists(config_path), "save_pretrained does not work."
 
                 with self.subTest():
                     # Test load
@@ -285,16 +405,22 @@ class BaseTest:
 
             if isinstance(self.RBLN_AUTO_CLASS, Iterable):
                 for auto_class in self.RBLN_AUTO_CLASS:
-                    assert self.RBLN_CLASS == auto_class.get_rbln_cls(
+                    assert (
+                        auto_class.get_rbln_cls(
+                            self.HF_MODEL_ID,
+                            **self.RBLN_CLASS_KWARGS,
+                            **self.HF_CONFIG_KWARGS,
+                        )
+                        == self.RBLN_CLASS
+                    )
+            else:
+                assert (
+                    self.RBLN_AUTO_CLASS.get_rbln_cls(
                         self.HF_MODEL_ID,
                         **self.RBLN_CLASS_KWARGS,
                         **self.HF_CONFIG_KWARGS,
                     )
-            else:
-                assert self.RBLN_CLASS == self.RBLN_AUTO_CLASS.get_rbln_cls(
-                    self.HF_MODEL_ID,
-                    **self.RBLN_CLASS_KWARGS,
-                    **self.HF_CONFIG_KWARGS,
+                    == self.RBLN_CLASS
                 )
 
         # check if this use a pipeline
@@ -340,7 +466,7 @@ class DisallowedTestBase:
                     **self.HF_CONFIG_KWARGS,
                 )
 
-                self.assertTrue(False, "This should be disallowed.")
+                raise AssertionError("This should be disallowed.")
 
             except ValueError:
                 pass

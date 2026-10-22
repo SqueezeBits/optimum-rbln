@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any
 
 import torch
 from diffusers.models.unets.unet_2d_condition import UNet2DConditionModel, UNet2DConditionOutput
@@ -21,13 +22,14 @@ from transformers import PretrainedConfig
 
 from ....configuration_utils import RBLNCompileConfig
 from ....modeling import RBLNModel
+from ....modeling_base import Preprocessor
 from ....utils.logging import get_logger
 from ...configurations import RBLNUNet2DConditionModelConfig
 from ...modeling_diffusers import RBLNDiffusionMixin, RBLNDiffusionMixinConfig
 
 
 if TYPE_CHECKING:
-    from transformers import AutoFeatureExtractor, AutoProcessor, AutoTokenizer, PreTrainedModel
+    from transformers import PreTrainedModel
 
 logger = get_logger(__name__)
 
@@ -40,11 +42,11 @@ class _UNet_SD(torch.nn.Module):
     def forward(
         self,
         sample: torch.Tensor,
-        timestep: Union[torch.Tensor, float, int],
+        timestep: torch.Tensor | float | int,
         encoder_hidden_states: torch.Tensor,
-        *down_and_mid_block_additional_residuals: Optional[Tuple[torch.Tensor]],
-        text_embeds: Optional[torch.Tensor] = None,
-        time_ids: Optional[torch.Tensor] = None,
+        *down_and_mid_block_additional_residuals: tuple[torch.Tensor] | None,
+        text_embeds: torch.Tensor | None = None,
+        time_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if text_embeds is not None and time_ids is not None:
             added_cond_kwargs = {"text_embeds": text_embeds, "time_ids": time_ids}
@@ -79,9 +81,9 @@ class _UNet_SDXL(torch.nn.Module):
     def forward(
         self,
         sample: torch.Tensor,
-        timestep: Union[torch.Tensor, float, int],
+        timestep: torch.Tensor | float | int,
         encoder_hidden_states: torch.Tensor,
-        *down_and_mid_block_additional_residuals: Optional[Tuple[torch.Tensor]],
+        *down_and_mid_block_additional_residuals: tuple[torch.Tensor] | None,
     ) -> torch.Tensor:
         if len(down_and_mid_block_additional_residuals) == 2:
             added_cond_kwargs = {
@@ -104,6 +106,9 @@ class _UNet_SDXL(torch.nn.Module):
             down_block_additional_residuals = None
             mid_block_additional_residual = None
 
+        if "text_embeds" in added_cond_kwargs:
+            added_cond_kwargs["text_embeds"] = added_cond_kwargs["text_embeds"].float()
+
         unet_out = self.unet(
             sample=sample,
             timestep=timestep,
@@ -124,7 +129,7 @@ class _UNet_Kandinsky(torch.nn.Module):
     def forward(
         self,
         sample: torch.Tensor,
-        timestep: Union[torch.Tensor, float, int],
+        timestep: torch.Tensor | float | int,
         image_embeds: torch.Tensor,
     ) -> torch.Tensor:
         added_cond_kwargs = {"image_embeds": image_embeds}
@@ -186,8 +191,8 @@ class RBLNUNet2DConditionModel(RBLNModel):
         cls,
         pipe: RBLNDiffusionMixin,
         rbln_config: RBLNUNet2DConditionModelConfig,
-        image_size: Optional[Tuple[int, int]] = None,
-    ) -> Tuple[int, int]:
+        image_size: tuple[int, int] | None = None,
+    ) -> tuple[int, int]:
         if hasattr(pipe, "movq"):
             scale_factor = 2 ** (len(pipe.movq.config.block_out_channels) - 1)
         else:
@@ -236,14 +241,14 @@ class RBLNUNet2DConditionModel(RBLNModel):
         rbln_config.unet.sample_size = cls.get_unet_sample_size(
             pipe, rbln_config.unet, image_size=rbln_config.image_size
         )
-        rbln_config.unet.use_additional_residuals = "controlnet" in pipe.config.keys()
+        rbln_config.unet.use_additional_residuals = "controlnet" in pipe.config
 
         return rbln_config
 
     @classmethod
     def _update_rbln_config(
         cls,
-        preprocessors: Union["AutoFeatureExtractor", "AutoProcessor", "AutoTokenizer"],
+        preprocessors: Sequence[Preprocessor],
         model: "PreTrainedModel",
         model_config: "PretrainedConfig",
         rbln_config: RBLNUNet2DConditionModelConfig,
@@ -263,7 +268,7 @@ class RBLNUNet2DConditionModel(RBLNModel):
                     rbln_config.sample_size[0],
                     rbln_config.sample_size[1],
                 ],
-                "float32",
+                rbln_config.dtype,
             ),
             ("timestep", [], "float32"),
         ]
@@ -273,7 +278,7 @@ class RBLNUNet2DConditionModel(RBLNModel):
                 (
                     "encoder_hidden_states",
                     [rbln_config.batch_size, rbln_config.max_seq_len, model_config.cross_attention_dim],
-                    "float32",
+                    rbln_config.dtype,
                 ),
             )
 
@@ -286,18 +291,18 @@ class RBLNUNet2DConditionModel(RBLNModel):
                 rbln_config.sample_size[1],
             ]
             height, width = rbln_config.sample_size[0], rbln_config.sample_size[1]
-            input_info.append(("down_block_additional_residuals_0", first_shape, "float32"))
+            input_info.append(("down_block_additional_residuals_0", first_shape, rbln_config.dtype))
             name_idx = 1
             for idx, _ in enumerate(model_config.down_block_types):
                 shape = [rbln_config.batch_size, model_config.block_out_channels[idx], height, width]
                 for _ in range(model_config.layers_per_block):
-                    input_info.append((f"down_block_additional_residuals_{name_idx}", shape, "float32"))
+                    input_info.append((f"down_block_additional_residuals_{name_idx}", shape, rbln_config.dtype))
                     name_idx += 1
                 if idx != len(model_config.down_block_types) - 1:
                     height = height // 2
                     width = width // 2
                     shape = [rbln_config.batch_size, model_config.block_out_channels[idx], height, width]
-                    input_info.append((f"down_block_additional_residuals_{name_idx}", shape, "float32"))
+                    input_info.append((f"down_block_additional_residuals_{name_idx}", shape, rbln_config.dtype))
                     name_idx += 1
 
             # mid block addtional residual
@@ -309,18 +314,19 @@ class RBLNUNet2DConditionModel(RBLNModel):
                 rbln_config.sample_size[0] // 2**num_cross_attn_blocks,
                 rbln_config.sample_size[1] // 2**num_cross_attn_blocks,
             ]
-            input_info.append(("mid_block_additional_residual", shape, "float32"))
+            input_info.append(("mid_block_additional_residual", shape, rbln_config.dtype))
 
         if hasattr(model_config, "addition_embed_type"):
             if model_config.addition_embed_type == "text_time":
                 rbln_config.in_features = model_config.projection_class_embeddings_input_dim
+                # Kept at the checkpoint dtype; `_UNet_SDXL.forward` promotes it for the concat inside the graph.
                 input_info.append(
-                    ("text_embeds", [rbln_config.batch_size, rbln_config.text_model_hidden_size], "float32")
+                    ("text_embeds", [rbln_config.batch_size, rbln_config.text_model_hidden_size], rbln_config.dtype)
                 )
-                input_info.append(("time_ids", [rbln_config.batch_size, 6], "float32"))
+                input_info.append(("time_ids", [rbln_config.batch_size, 6], rbln_config.dtype))
             elif model_config.addition_embed_type == "image":
                 input_info.append(
-                    ("image_embeds", [rbln_config.batch_size, rbln_config.image_model_hidden_size], "float32")
+                    ("image_embeds", [rbln_config.batch_size, rbln_config.image_model_hidden_size], rbln_config.dtype)
                 )
 
         rbln_compile_config = RBLNCompileConfig(input_info=input_info)
@@ -335,35 +341,35 @@ class RBLNUNet2DConditionModel(RBLNModel):
     def forward(
         self,
         sample: torch.Tensor,
-        timestep: Union[torch.Tensor, float, int],
+        timestep: torch.Tensor | float | int,
         encoder_hidden_states: torch.Tensor,
-        class_labels: Optional[torch.Tensor] = None,
-        timestep_cond: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        cross_attention_kwargs: Optional[Dict[str, Any]] = None,
-        added_cond_kwargs: Optional[Dict[str, torch.Tensor]] = None,
-        down_block_additional_residuals: Optional[Tuple[torch.Tensor]] = None,
-        mid_block_additional_residual: Optional[torch.Tensor] = None,
-        down_intrablock_additional_residuals: Optional[Tuple[torch.Tensor]] = None,
-        encoder_attention_mask: Optional[torch.Tensor] = None,
+        class_labels: torch.Tensor | None = None,
+        timestep_cond: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        cross_attention_kwargs: dict[str, Any] | None = None,
+        added_cond_kwargs: dict[str, torch.Tensor] | None = None,
+        down_block_additional_residuals: tuple[torch.Tensor] | None = None,
+        mid_block_additional_residual: torch.Tensor | None = None,
+        down_intrablock_additional_residuals: tuple[torch.Tensor] | None = None,
+        encoder_attention_mask: torch.Tensor | None = None,
         return_dict: bool = True,
         **kwargs,
-    ) -> Union[UNet2DConditionOutput, Tuple]:
+    ) -> UNet2DConditionOutput | tuple:
         """
         Forward pass for the RBLN-optimized UNet2DConditionModel.
 
         Args:
             sample (torch.Tensor): The noisy input tensor with the following shape `(batch, channel, height, width)`.
-            timestep (Union[torch.Tensor, float, int]): The number of timesteps to denoise an input.
+            timestep (torch.Tensor | float | int): The number of timesteps to denoise an input.
             encoder_hidden_states (torch.Tensor): The encoder hidden states.
-            added_cond_kwargs (Dict[str, torch.Tensor]): A kwargs dictionary containing additional embeddings that
+            added_cond_kwargs (dict[str, torch.Tensor]): A kwargs dictionary containing additional embeddings that
                 if specified are added to the embeddings that are passed along to the UNet blocks.
-            down_block_additional_residuals (Optional[Tuple[torch.Tensor]]): A tuple of tensors that if specified are added to the residuals of down unet blocks.
-            mid_block_additional_residual (Optional[torch.Tensor]): A tensor that if specified is added to the residual of the middle unet block.
+            down_block_additional_residuals (tuple[torch.Tensor] | None): A tuple of tensors that if specified are added to the residuals of down unet blocks.
+            mid_block_additional_residual (torch.Tensor | None): A tensor that if specified is added to the residual of the middle unet block.
             return_dict (bool): Whether or not to return a [`~diffusers.models.unets.unet_2d_condition.UNet2DConditionOutput`] instead of a plain tuple.
 
         Returns:
-            (Union[`~diffusers.models.unets.unet_2d_condition.UNet2DConditionOutput`], Tuple)
+            (`~diffusers.models.unets.unet_2d_condition.UNet2DConditionOutput`, Tuple)
         """
         sample_batch_size = sample.size()[0]
         compiled_batch_size = self.compiled_batch_size
@@ -377,15 +383,14 @@ class RBLNUNet2DConditionModel(RBLNModel):
                 "For details, see: https://docs.rbln.ai/software/optimum/model_api/diffusers/pipelines/stable_diffusion.html#important-batch-size-configuration-for-guidance-scale"
             )
 
-        added_cond_kwargs = {} if added_cond_kwargs is None else added_cond_kwargs
+        added_cond_kwargs = added_cond_kwargs or {}
 
         if down_block_additional_residuals is not None:
-            down_block_additional_residuals = [t.contiguous() for t in down_block_additional_residuals]
             return super().forward(
                 sample.contiguous(),
                 timestep.float(),
                 encoder_hidden_states,
-                *down_block_additional_residuals,
+                *(t.contiguous() for t in down_block_additional_residuals),
                 mid_block_additional_residual,
                 **added_cond_kwargs,
                 return_dict=return_dict,
@@ -406,3 +411,8 @@ class RBLNUNet2DConditionModel(RBLNModel):
             **added_cond_kwargs,
             return_dict=return_dict,
         )
+
+
+__all__ = [
+    "RBLNUNet2DConditionModel",
+]

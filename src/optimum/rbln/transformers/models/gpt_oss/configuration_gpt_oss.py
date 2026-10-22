@@ -28,7 +28,7 @@ class RBLNGptOssForCausalLMConfig(RBLNDecoderOnlyModelForCausalLMConfig):
     # Create a configuration object
     config = RBLNGptOssForCausalLMConfig(
         batch_size=1,
-        tensor_parallel_size=8,
+        num_devices=8,
         kvcache_partition_len=8192,
     )
 
@@ -40,3 +40,8 @@ class RBLNGptOssForCausalLMConfig(RBLNDecoderOnlyModelForCausalLMConfig):
     )
     ```
     """
+
+
+__all__ = [
+    "RBLNGptOssForCausalLMConfig",
+]

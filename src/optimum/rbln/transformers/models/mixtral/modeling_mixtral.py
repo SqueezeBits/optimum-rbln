@@ -13,10 +13,11 @@
 # limitations under the License.
 
 from ...models.decoderonly import RBLNDecoderOnlyModelForCausalLM
+from ...utils.moe import RBLNMoeLoadMixin
 from .mixtral_architecture import MixtralWrapper
 
 
-class RBLNMixtralForCausalLM(RBLNDecoderOnlyModelForCausalLM):
+class RBLNMixtralForCausalLM(RBLNMoeLoadMixin, RBLNDecoderOnlyModelForCausalLM):
     """
     The Mixtral is a Mixture-of-Experts (MoE) variant of Mixtral, available as a base model and an aligned chat model.
     This model inherits from [`RBLNDecoderOnlyModelForCausalLM`]. Check the superclass documentation for the generic methods the library implements for all its models.
@@ -37,13 +38,13 @@ class RBLNMixtralForCausalLM(RBLNDecoderOnlyModelForCausalLM):
             "mistralai/Mixtral-8x7B-Instruct-v0.1",
             export=True,
             rbln_batch_size=1,
-            rbln_tensor_parallel_size=4,
+            rbln_num_devices=4,
         )
         # Using a config dictionary
         rbln_config = {
             "batch_size": 1,
             "max_seq_len": 32768,
-            "tensor_parallel_size": 4,
+            "num_devices": 4,
         }
         model = RBLNMixtralForCausalLM.from_pretrained(
             "mistralai/Mixtral-8x7B-Instruct-v0.1",
@@ -55,7 +56,7 @@ class RBLNMixtralForCausalLM(RBLNDecoderOnlyModelForCausalLM):
         config = RBLNMixtralForCausalLMConfig(
             batch_size=1,
             max_seq_len=32768,
-            tensor_parallel_size=4
+            num_devices=4
         )
         model = RBLNMixtralForCausalLM.from_pretrained(
             "mistralai/Mixtral-8x7B-Instruct-v0.1",
@@ -66,3 +67,8 @@ class RBLNMixtralForCausalLM(RBLNDecoderOnlyModelForCausalLM):
     """
 
     _decoder_wrapper_cls = MixtralWrapper
+
+
+__all__ = [
+    "RBLNMixtralForCausalLM",
+]

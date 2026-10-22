@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import TYPE_CHECKING, Any, Dict, List, Union
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any
 
 import rebel
 import torch
@@ -20,18 +21,17 @@ from diffusers.models.autoencoders.autoencoder_kl_cosmos import AutoencoderKLCos
 from diffusers.models.autoencoders.vae import DecoderOutput
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 from torch.nn import functional as F
-from transformers import PretrainedConfig
 
 from ....configuration_utils import RBLNCompileConfig
 from ....modeling import RBLNModel
+from ....modeling_base import Preprocessor
 from ....utils.logging import get_logger
 from ...configurations import RBLNAutoencoderKLCosmosConfig
 from .vae import RBLNRuntimeCosmosVAEDecoder, RBLNRuntimeCosmosVAEEncoder, _VAECosmosDecoder, _VAECosmosEncoder
 
 
 if TYPE_CHECKING:
-    import torch
-    from transformers import AutoFeatureExtractor, AutoProcessor, AutoTokenizer, PreTrainedModel
+    from transformers import PretrainedConfig, PreTrainedModel
 
     from ...modeling_diffusers import RBLNDiffusionMixin, RBLNDiffusionMixinConfig
 
@@ -84,7 +84,7 @@ class RBLNAutoencoderKLCosmos(RBLNModel):
     @classmethod
     def get_compiled_model(
         cls, model, rbln_config: RBLNAutoencoderKLCosmosConfig
-    ) -> Dict[str, rebel.RBLNCompiledModel]:
+    ) -> dict[str, rebel.RBLNCompiledModel]:
         def replaced_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
             if self.temporal_pad != 0:
                 hidden_states_prev = hidden_states[:, :, :1, ...].repeat(1, 1, self.temporal_pad, 1, 1)
@@ -133,7 +133,7 @@ class RBLNAutoencoderKLCosmos(RBLNModel):
     @classmethod
     def _update_rbln_config(
         cls,
-        preprocessors: Union["AutoFeatureExtractor", "AutoProcessor", "AutoTokenizer"],
+        preprocessors: Sequence[Preprocessor],
         model: "PreTrainedModel",
         model_config: "PretrainedConfig",
         rbln_config: RBLNAutoencoderKLCosmosConfig,
@@ -151,7 +151,7 @@ class RBLNAutoencoderKLCosmos(RBLNModel):
                         rbln_config.height,
                         rbln_config.width,
                     ],
-                    "float32",
+                    rbln_config.dtype,
                 ),
             ]
             compile_cfgs.append(RBLNCompileConfig(compiled_model_name="encoder", input_info=vae_enc_input_info))
@@ -170,7 +170,7 @@ class RBLNAutoencoderKLCosmos(RBLNModel):
                     latent_height,
                     latent_width,
                 ],
-                "float32",
+                rbln_config.dtype,
             ),
         ]
         compile_cfgs.append(RBLNCompileConfig(compiled_model_name="decoder", input_info=vae_dec_input_info))
@@ -181,9 +181,9 @@ class RBLNAutoencoderKLCosmos(RBLNModel):
     @classmethod
     def _create_runtimes(
         cls,
-        compiled_models: List[rebel.RBLNCompiledModel],
+        compiled_models: list[rebel.RBLNCompiledModel],
         rbln_config: RBLNAutoencoderKLCosmosConfig,
-    ) -> List[rebel.Runtime]:
+    ) -> list[rebel.Runtime]:
         if len(compiled_models) == 1:
             # decoder
             expected_models = ["decoder"]
@@ -206,8 +206,8 @@ class RBLNAutoencoderKLCosmos(RBLNModel):
         ]
 
     def encode(
-        self, x: torch.FloatTensor, return_dict: bool = True, **kwargs: Dict[str, Any]
-    ) -> Union[torch.FloatTensor, AutoencoderKLOutput]:
+        self, x: torch.FloatTensor, return_dict: bool = True, **kwargs: dict[str, Any]
+    ) -> torch.FloatTensor | AutoencoderKLOutput:
         """
         Encode an input video into a latent representation.
 
@@ -220,12 +220,12 @@ class RBLNAutoencoderKLCosmos(RBLNModel):
         Returns:
             The latent representation or AutoencoderKLOutput if return_dict=True
         """
-        posterior = self.encoder.encode(x)
+        posterior = self.encoder.encode(x.to(self.rbln_config.dtype))
         if not return_dict:
             return (posterior,)
         return AutoencoderKLOutput(latent_dist=posterior)
 
-    def decode(self, z: torch.FloatTensor, return_dict: bool = True) -> Union[torch.FloatTensor, DecoderOutput]:
+    def decode(self, z: torch.FloatTensor, return_dict: bool = True) -> torch.FloatTensor | DecoderOutput:
         """
         Decode a latent representation into a video.
 
@@ -237,9 +237,14 @@ class RBLNAutoencoderKLCosmos(RBLNModel):
         Returns:
             The decoded video or DecoderOutput if return_dict=True
         """
-        decoded = self.decoder.decode(z)
+        decoded = self.decoder.decode(z.to(self.rbln_config.dtype))
 
         if not return_dict:
             return (decoded,)
 
         return DecoderOutput(sample=decoded)
+
+
+__all__ = [
+    "RBLNAutoencoderKLCosmos",
+]

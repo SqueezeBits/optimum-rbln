@@ -1,6 +1,5 @@
 import math
 from pathlib import Path
-from typing import Optional
 
 import safetensors.torch
 import torch
@@ -76,7 +75,7 @@ class LoRALinear(nn.Module):
 
         # Try to load weights in order of preference
         weight_files = [
-            ("adapter_model.safetensors", lambda p: safetensors.torch.load_file(p)),
+            ("adapter_model.safetensors", safetensors.torch.load_file),
             ("adapter_model.bin", lambda p: torch.load(p, map_location="cpu")),
             ("pytorch_model.bin", lambda p: torch.load(p, map_location="cpu")),
         ]
@@ -166,7 +165,7 @@ class LoRALinear(nn.Module):
             "lora_b_weights", torch.stack(lora_b_transposed, dim=0).to(self.weight.dtype)
         )  # [num_adapters, rank, out_features]
 
-    def forward(self, x: torch.Tensor, lora_int_id: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, lora_int_id: torch.Tensor | None = None) -> torch.Tensor:
         """
         Forward pass that combines base linear transformation with LoRA.
 

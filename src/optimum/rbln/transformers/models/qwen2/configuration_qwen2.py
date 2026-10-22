@@ -29,7 +29,7 @@ class RBLNQwen2ForCausalLMConfig(RBLNDecoderOnlyModelForCausalLMConfig):
     config = RBLNQwen2ForCausalLMConfig(
         batch_size=1,
         max_seq_len=4096,
-        tensor_parallel_size=4
+        num_devices=4
     )
 
     # Use the configuration with from_pretrained
@@ -48,3 +48,9 @@ class RBLNQwen2ModelConfig(RBLNDecoderOnlyModelConfig):
 
     This class is an alias of RBLNDecoderOnlyModelConfig.
     """
+
+
+__all__ = [
+    "RBLNQwen2ForCausalLMConfig",
+    "RBLNQwen2ModelConfig",
+]

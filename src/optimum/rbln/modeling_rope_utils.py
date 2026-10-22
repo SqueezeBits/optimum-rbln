@@ -1,0 +1,513 @@
+# Copyright 2024 The HuggingFace Team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Copyright 2025 Rebellions Inc. All rights reserved.
+
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at:
+
+#     http://www.apache.org/licenses/LICENSE-2.0
+
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import math
+from collections.abc import Sequence
+from typing import Optional, Protocol
+
+import numpy as np
+import torch
+from transformers import PretrainedConfig
+
+from .utils.logging import get_logger
+
+
+logger = get_logger(__name__)
+
+
+def np_cos(x: torch.Tensor) -> torch.Tensor:
+    """cos(x) computed on the host via numpy.
+
+    torch's CPU cos/sin kernels are not bit-reproducible: the result can differ in the
+    last bits depending on the OMP/MKL thread configuration and the tensor size, while
+    numpy's are reproducible across thread counts. Any cos/sin computed on the host
+    (e.g. rotary tables fed to a compiled graph as inputs) must use these helpers.
+    """
+    return torch.from_numpy(np.cos(x.detach().cpu().numpy()))
+
+
+def np_sin(x: torch.Tensor) -> torch.Tensor:
+    """sin(x) computed on the host via numpy. See `np_cos` for why."""
+    return torch.from_numpy(np.sin(x.detach().cpu().numpy()))
+
+
+class _RotaryEmbedding(Protocol):
+    attention_scaling: float
+    inv_freq: torch.Tensor
+    mrope_section: Sequence[int]
+
+
+class QwenMRopeLookupTable:
+    """Deterministic drop-in for host-side HF rotary modules: cos/sin tables built once
+    via np_cos/np_sin, gathered per call; out-of-range positions use the bit-identical
+    dynamic numpy path. Handles standard mrope ([3, bs, seq, dim], merge in caller) and
+    interleaved mrope (axis selection baked into the gather index). Default rope_type only.
+    """
+
+    def __init__(self, rotary_emb: _RotaryEmbedding, max_seq_len: int):
+        self.attention_scaling = rotary_emb.attention_scaling
+        half_dim = rotary_emb.inv_freq.shape[0]
+        self.inv_freq_full = torch.cat([rotary_emb.inv_freq.float()] * 2)
+        self.table_len = max_seq_len
+        vals = torch.outer(torch.arange(self.table_len, dtype=torch.float32), self.inv_freq_full)
+        self.cos_table = np_cos(vals) * self.attention_scaling
+        self.sin_table = np_sin(vals) * self.attention_scaling
+
+        self.interleave_index: torch.Tensor | None = None
+        if hasattr(rotary_emb, "apply_interleaved_mrope"):
+            section = rotary_emb.mrope_section
+            sigma = torch.zeros(half_dim, dtype=torch.long)
+            sigma[1 : section[1] * 3 : 3] = 1
+            sigma[2 : section[2] * 3 : 3] = 2
+            self.interleave_index = torch.cat([sigma, sigma])
+            self.col_index = torch.arange(2 * half_dim)
+
+    def _dynamic(self, pos_per_column: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        vals = pos_per_column.float() * self.inv_freq_full
+        return np_cos(vals) * self.attention_scaling, np_sin(vals) * self.attention_scaling
+
+    def __call__(self, x: torch.Tensor, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if position_ids.ndim == 2:
+            position_ids = position_ids[None, ...].expand(3, *position_ids.shape)
+        if self.interleave_index is None:
+            if position_ids.min() >= 0 and position_ids.max() < self.table_len:
+                return self.cos_table[position_ids], self.sin_table[position_ids]
+            return self._dynamic(position_ids[..., None])
+        pos_sel = position_ids[self.interleave_index].permute(1, 2, 0)
+        if pos_sel.min() >= 0 and pos_sel.max() < self.table_len:
+            return self.cos_table[pos_sel, self.col_index], self.sin_table[pos_sel, self.col_index]
+        return self._dynamic(pos_sel)
+
+
+def build_qwen_mrope_lookup(rotary_emb: _RotaryEmbedding, max_seq_len: int) -> QwenMRopeLookupTable | _RotaryEmbedding:
+    # the table only requires inv_freq to be static after load; dynamic/longrope mutate it at runtime
+    rope_type = getattr(rotary_emb, "rope_type", "default")
+    if rope_type not in ("dynamic", "longrope"):
+        return QwenMRopeLookupTable(rotary_emb, max_seq_len)
+    logger.warning(
+        f"rope_type={rope_type!r} cannot use the deterministic rotary lookup table; "
+        "host cos/sin stays on the torch path and may vary with the thread configuration."
+    )
+    return rotary_emb
+
+
+def qwen_vit_rot_pos_ids(grid_thw: torch.Tensor, spatial_merge_size: int) -> torch.Tensor:
+    """(h, w) rotary position ids per patch, merge-block ordered (mirrors HF ViT rot_pos_emb)."""
+    pos_ids = []
+    for t, h, w in grid_thw.tolist():
+        hpos = torch.arange(h).unsqueeze(1).expand(-1, w)
+        hpos = hpos.reshape(h // spatial_merge_size, spatial_merge_size, w // spatial_merge_size, spatial_merge_size)
+        hpos = hpos.permute(0, 2, 1, 3).flatten()
+        wpos = torch.arange(w).unsqueeze(0).expand(h, -1)
+        wpos = wpos.reshape(h // spatial_merge_size, spatial_merge_size, w // spatial_merge_size, spatial_merge_size)
+        wpos = wpos.permute(0, 2, 1, 3).flatten()
+        pos_ids.append(torch.stack([hpos, wpos], dim=-1).repeat(t, 1))
+    return torch.cat(pos_ids, dim=0)
+
+
+def _get_rope_theta(config: PretrainedConfig) -> float:
+    if hasattr(config, "rope_theta"):
+        return config.rope_theta
+    rope_parameters = getattr(config, "rope_parameters", None)
+    if rope_parameters and isinstance(rope_parameters, dict) and "rope_theta" in rope_parameters:
+        return rope_parameters["rope_theta"]
+    return 10000.0
+
+
+def _compute_default_rope_parameters(
+    config: PretrainedConfig,
+    device: Optional["torch.device"] = None,
+    seq_len: int | None = None,
+) -> tuple["torch.Tensor", float]:
+    """
+    Computes the inverse frequencies according to the original RoPE implementation
+    Args:
+        config ([`~transformers.PretrainedConfig`]):
+            The model configuration.
+        device (`torch.device`):
+            The device to use for initialization of the inverse frequencies.
+        seq_len (`int`, *optional*):
+            The current sequence length. Unused for this type of RoPE.
+    Returns:
+        Tuple of (`torch.Tensor`, `float`), containing the inverse frequencies for the RoPE embeddings and the
+        post-processing scaling factor applied to the computed cos/sin (unused in this type of RoPE).
+    """
+    base = _get_rope_theta(config)
+    partial_rotary_factor = config.partial_rotary_factor if hasattr(config, "partial_rotary_factor") else 1.0
+    head_dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+    dim = int(head_dim * partial_rotary_factor)
+
+    attention_factor = 1.0  # Unused in this type of RoPE
+
+    # Compute the inverse frequencies
+    inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim))
+    return inv_freq, attention_factor
+
+
+def _compute_linear_scaling_rope_parameters(
+    config: PretrainedConfig,
+    device: Optional["torch.device"] = None,
+    seq_len: int | None = None,
+) -> tuple["torch.Tensor", float]:
+    """
+    Computes the inverse frequencies with linear scaling. Credits to the Reddit user /u/kaiokendev
+    Args:
+        config ([`~transformers.PretrainedConfig`]):
+            The model configuration.
+        device (`torch.device`):
+            The device to use for initialization of the inverse frequencies.
+        seq_len (`int`, *optional*):
+            The current sequence length. Unused for this type of RoPE.
+    Returns:
+        Tuple of (`torch.Tensor`, `float`), containing the inverse frequencies for the RoPE embeddings and the
+        post-processing scaling factor applied to the computed cos/sin (unused in this type of RoPE).
+    """
+    factor = config.rope_scaling["factor"]
+
+    # Gets the default RoPE parameters
+    inv_freq, attention_factor = _compute_default_rope_parameters(config, device, seq_len)
+
+    # Then applies linear scaling to the frequencies.
+    # NOTE: originally, scaling was applied to the position_ids. However, we get `embs = inv_freq @ position_ids`, so
+    # applying scaling to the inverse frequencies is equivalent.
+    inv_freq /= factor
+    return inv_freq, attention_factor
+
+
+def _compute_dynamic_ntk_parameters(
+    config: PretrainedConfig,
+    device: Optional["torch.device"] = None,
+    seq_len: int | None = None,
+) -> tuple["torch.Tensor", float]:
+    """
+    Computes the inverse frequencies with NTK scaling. Credits to the Reddit users /u/bloc97 and /u/emozilla
+    Args:
+        config ([`~transformers.PretrainedConfig`]):
+            The model configuration.
+        device (`torch.device`):
+            The device to use for initialization of the inverse frequencies.
+        seq_len (`int`, *optional*):
+            The current sequence length, used to update the dynamic RoPE at inference time.
+    Returns:
+        Tuple of (`torch.Tensor`, `float`), containing the inverse frequencies for the RoPE embeddings and the
+        post-processing scaling factor applied to the computed cos/sin (unused in this type of RoPE).
+    """
+    # TODO (joao): use the new `original_max_position_embeddings` from rope_scaling
+    base = _get_rope_theta(config)
+    partial_rotary_factor = config.partial_rotary_factor if hasattr(config, "partial_rotary_factor") else 1.0
+    head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+    dim = int(head_dim * partial_rotary_factor)
+    max_position_embeddings = config.max_position_embeddings
+    factor = config.rope_scaling["factor"]
+
+    attention_factor = 1.0  # Unused in this type of RoPE
+
+    # seq_len: default to max_position_embeddings, e.g. at init time
+    if seq_len is None:
+        seq_len = max_position_embeddings
+    elif isinstance(seq_len, torch.Tensor):
+        seq_len = torch.maximum(
+            seq_len,
+            torch.tensor(max_position_embeddings, dtype=seq_len.dtype, device=seq_len.device),
+        )
+    else:
+        seq_len = max(seq_len, max_position_embeddings)
+
+    # Process with chunk_size to reduce precesion error
+    chunk_size = 4096
+    chunks = (seq_len + chunk_size - 1) // chunk_size
+
+    inv_freq_list = []
+    for i in range(chunks):
+        start = i * chunk_size
+        end = min((i + 1) * chunk_size, seq_len)
+
+        seq_lens = torch.arange(start, end, dtype=torch.float32).view(-1, 1) + 1.0
+        seq_lens = torch.where(seq_lens > max_position_embeddings, seq_lens, max_position_embeddings)
+
+        # Compute the inverse frequencies for each chunk
+        scaled_base = base * ((factor * seq_lens / max_position_embeddings) - (factor - 1)) ** (dim / (dim - 2))
+        inv_freq = 1.0 / (scaled_base ** (torch.arange(0, dim, 2, dtype=torch.int64).float() / dim))
+
+        inv_freq_list.append(inv_freq)
+
+    final_inv_freq = torch.cat(inv_freq_list, dim=0)
+
+    return final_inv_freq, attention_factor
+
+
+def _compute_yarn_parameters(
+    config: PretrainedConfig, device: "torch.device", seq_len: int | None = None
+) -> tuple["torch.Tensor", float]:
+    """
+    Computes the inverse frequencies with NTK scaling. Please refer to the
+    [original paper](https://huggingface.co/papers/2309.00071)
+    Args:
+        config ([`~transformers.PretrainedConfig`]):
+            The model configuration.
+        device (`torch.device`):
+            The device to use for initialization of the inverse frequencies.
+        seq_len (`int`, *optional*):
+            The current sequence length. Unused for this type of RoPE.
+    Returns:
+        Tuple of (`torch.Tensor`, `float`), containing the inverse frequencies for the RoPE embeddings and the
+        post-processing scaling factor applied to the computed cos/sin.
+    """
+
+    base = _get_rope_theta(config)
+    partial_rotary_factor = config.partial_rotary_factor if hasattr(config, "partial_rotary_factor") else 1.0
+    head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+    dim = int(head_dim * partial_rotary_factor)
+    factor = config.rope_scaling["factor"]
+    attention_factor = config.rope_scaling.get("attention_factor")
+    mscale = config.rope_scaling.get("mscale")
+    mscale_all_dim = config.rope_scaling.get("mscale_all_dim")
+    original_max_position_embeddings = (
+        config.rope_scaling.get("original_max_position_embeddings") or config.max_position_embeddings
+    )
+
+    def get_mscale(scale, mscale=1):
+        if scale <= 1:
+            return 1.0
+        return 0.1 * mscale * math.log(scale) + 1.0
+
+    # Sets the attention factor as suggested in the paper
+    if attention_factor is None:
+        if mscale and mscale_all_dim:
+            attention_factor = float(get_mscale(factor, mscale) / get_mscale(factor, mscale_all_dim))
+        else:
+            attention_factor = get_mscale(factor)
+
+    # Optional config options
+    # beta_fast/beta_slow: as suggested in the paper, default to 32/1 (correspondingly)
+    beta_fast = config.rope_scaling.get("beta_fast") or 32
+    beta_slow = config.rope_scaling.get("beta_slow") or 1
+
+    # Compute the inverse frequencies
+    def find_correction_dim(num_rotations, dim, base, max_position_embeddings):
+        """Inverse dimension formula to find the dimension based on the number of rotations"""
+        return (dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))) / (2 * math.log(base))
+
+    def find_correction_range(low_rot, high_rot, dim, base, max_position_embeddings, truncate):
+        """Find dimension range bounds based on rotations"""
+        low = find_correction_dim(low_rot, dim, base, max_position_embeddings)
+        high = find_correction_dim(high_rot, dim, base, max_position_embeddings)
+        if truncate:
+            low = math.floor(low)
+            high = math.ceil(high)
+        return max(low, 0), min(high, dim - 1)
+
+    def linear_ramp_factor(min, max, dim):
+        if min == max:
+            max += 0.001  # Prevent singularity
+
+        linear_func = (torch.arange(dim, dtype=torch.float32) - min) / (max - min)
+        ramp_func = torch.clamp(linear_func, 0, 1)
+        return ramp_func
+
+    # Note on variable naming: "interpolation" comes from the original technique, where we interpolate the position IDs
+    # to expand the possible context length. In other words, interpolation = apply scaling factor.
+    pos_freqs = base ** (torch.arange(0, dim, 2).to(device=device, dtype=torch.float) / dim)
+    inv_freq_extrapolation = 1.0 / pos_freqs
+    inv_freq_interpolation = 1.0 / (factor * pos_freqs)
+
+    truncate = config.rope_scaling.get("truncate", True)
+    low, high = find_correction_range(beta_fast, beta_slow, dim, base, original_max_position_embeddings, truncate)
+
+    # Get n-dimensional rotational scaling corrected for extrapolation
+    inv_freq_extrapolation_factor = 1 - linear_ramp_factor(low, high, dim // 2).to(device=device, dtype=torch.float)
+    inv_freq = (
+        inv_freq_interpolation * (1 - inv_freq_extrapolation_factor)
+        + inv_freq_extrapolation * inv_freq_extrapolation_factor
+    )
+    return inv_freq, attention_factor
+
+
+def _compute_longrope_parameters(
+    config: PretrainedConfig, device: "torch.device", seq_len: int | None = None
+) -> tuple["torch.Tensor", float]:
+    """
+    Computes the inverse frequencies with LongRoPE scaling. Please refer to the
+    [original implementation](https://github.com/microsoft/LongRoPE)
+    Args:
+        config ([`~transformers.PretrainedConfig`]):
+            The model configuration.
+        device (`torch.device`):
+            The device to use for initialization of the inverse frequencies.
+        seq_len (`int`, *optional*):
+            The current sequence length.
+    Returns:
+        Tuple of (`torch.Tensor`, `float`), containing the inverse frequencies for the RoPE embeddings and the
+        post-processing scaling factor applied to the computed cos/sin.
+    """
+    # TODO (joao): use the new `original_max_position_embeddings` from rope_scaling
+    base = _get_rope_theta(config)
+    partial_rotary_factor = config.partial_rotary_factor if hasattr(config, "partial_rotary_factor") else 1.0
+    head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+    dim = int(head_dim * partial_rotary_factor)
+    long_factor = config.rope_scaling["long_factor"]
+    short_factor = config.rope_scaling["short_factor"]
+    factor = config.rope_scaling.get("factor")
+    attention_factor = config.rope_scaling.get("attention_factor")
+
+    # NOTE: Phi3 (and potentially other models) modify `max_position_embeddings` and have a
+    # `original_max_position_embeddings` field containing the pretrained value. They use the ratio between these two
+    # values to compute the default attention scaling factor, instead of using `factor`.
+    if hasattr(config, "original_max_position_embeddings"):
+        original_max_position_embeddings = config.original_max_position_embeddings
+        factor = config.max_position_embeddings / config.original_max_position_embeddings
+    else:
+        original_max_position_embeddings = config.max_position_embeddings
+
+    # Sets the attention factor as suggested in the paper
+    if attention_factor is None:
+        if factor <= 1.0:
+            attention_factor = 1.0
+        else:
+            attention_factor = math.sqrt(1 + math.log(factor) / math.log(original_max_position_embeddings))
+
+    # Compute the inverse frequencies -- scaled based on the target sequence length
+    if seq_len and seq_len > original_max_position_embeddings:
+        ext_factors = torch.tensor(long_factor, dtype=torch.float32, device=device)
+    else:
+        ext_factors = torch.tensor(short_factor, dtype=torch.float32, device=device)
+    inv_freq_shape = torch.arange(0, dim, 2, dtype=torch.int64, device=device).float() / dim
+    inv_freq = 1.0 / (ext_factors * base**inv_freq_shape)
+
+    return inv_freq, attention_factor
+
+
+def _compute_llama3_parameters(
+    config: PretrainedConfig, device: "torch.device", seq_len: int | None = None
+) -> tuple["torch.Tensor", float]:
+    """
+    Computes the inverse frequencies for llama 3.1.
+
+    Args:
+        config ([`~transformers.PretrainedConfig`]):
+            The model configuration.
+        device (`torch.device`):
+            The device to use for initialization of the inverse frequencies.
+        seq_len (`int`, *optional*):
+            The current sequence length. Unused for this type of RoPE.
+    Returns:
+        Tuple of (`torch.Tensor`, `float`), containing the inverse frequencies for the RoPE embeddings and the
+        post-processing scaling factor applied to the computed cos/sin.
+    """
+    # Gets the default RoPE parameters
+    inv_freq, attention_factor = _compute_default_rope_parameters(config, device, seq_len)
+
+    factor = config.rope_scaling["factor"]  # `8` in the original implementation
+    low_freq_factor = config.rope_scaling["low_freq_factor"]  # `1` in the original implementation
+    high_freq_factor = config.rope_scaling["high_freq_factor"]  # `4` in the original implementation
+    old_context_len = config.rope_scaling["original_max_position_embeddings"]  # `8192` in the original implementation
+
+    low_freq_wavelen = old_context_len / low_freq_factor
+    high_freq_wavelen = old_context_len / high_freq_factor
+
+    wavelen = 2 * math.pi / inv_freq
+    # wavelen < high_freq_wavelen: do nothing
+    # wavelen > low_freq_wavelen: divide by factor
+    inv_freq_llama = torch.where(wavelen > low_freq_wavelen, inv_freq / factor, inv_freq)
+    # otherwise: interpolate between the two, using a smooth factor
+    smooth_factor = (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor)
+    smoothed_inv_freq = (1 - smooth_factor) * inv_freq_llama / factor + smooth_factor * inv_freq_llama
+    is_medium_freq = ~(wavelen < high_freq_wavelen) * ~(wavelen > low_freq_wavelen)
+    inv_freq_llama = torch.where(is_medium_freq, smoothed_inv_freq, inv_freq_llama)
+
+    return inv_freq_llama, attention_factor
+
+
+def _compute_proportional_rope_parameters(
+    config: PretrainedConfig,
+    device: "torch.device",
+    seq_len: int | None = None,
+    layer_type: str | None = None,
+    head_dim_key: str = "head_dim",
+) -> tuple["torch.Tensor", float]:
+    """
+    Computes the inverse frequencies with proportional RoPE.
+
+    Args:
+        config ([`~transformers.PretrainedConfig`]):
+            The model configuration.
+        device (`torch.device`):
+            The device to use for initialization of the inverse frequencies.
+        seq_len (`int`, *optional*):
+            The current sequence length. Unused for this type of RoPE.
+        head_dim_key
+
+    Returns:
+        Tuple of (`torch.Tensor`, `float`), containing the inverse frequencies for the RoPE embeddings and the
+        post-processing scaling factor applied to the computed cos/sin.
+    """
+
+    rope_parameters_dict = config.rope_parameters[layer_type] if layer_type is not None else config.rope_parameters
+
+    head_dim = getattr(config, head_dim_key, None) or config.hidden_size // config.num_attention_heads
+    base = rope_parameters_dict["rope_theta"]
+    factor = rope_parameters_dict.get("factor", 1.0)
+    rope_proportion = rope_parameters_dict.get("partial_rotary_factor", 1.0)
+
+    attention_factor = 1.0  # Unused in this type of RoPE
+
+    rope_angles = int(rope_proportion * head_dim // 2)
+
+    inv_freq_rotated = 1.0 / (
+        base
+        ** (torch.arange(0, 2 * rope_angles, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / head_dim)
+    )
+
+    nope_angles = head_dim // 2 - rope_angles
+    if nope_angles > 0:
+        inv_freq = torch.cat(
+            (
+                inv_freq_rotated,
+                torch.zeros(nope_angles, dtype=torch.float32, device=device),
+            ),
+            dim=0,
+        )
+    else:
+        inv_freq = inv_freq_rotated
+
+    inv_freq /= factor
+    return inv_freq, attention_factor
+
+
+# This maps the "rope_type" string field in rope config to the corresponding function to compute the RoPE parameters
+# from the model config. You can append new {'rope_type': callable} pairs to this dictionary to enable custom RoPE
+# parameterizations, as long as the callable has the same signature.
+ROPE_INIT_FUNCTIONS = {
+    "default": _compute_default_rope_parameters,
+    "linear": _compute_linear_scaling_rope_parameters,
+    "dynamic": _compute_dynamic_ntk_parameters,
+    "yarn": _compute_yarn_parameters,
+    "longrope": _compute_longrope_parameters,
+    "llama3": _compute_llama3_parameters,
+    "proportional": _compute_proportional_rope_parameters,
+}

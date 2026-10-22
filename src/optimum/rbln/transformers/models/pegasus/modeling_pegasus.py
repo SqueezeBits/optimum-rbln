@@ -13,7 +13,8 @@
 # limitations under the License.
 
 import inspect
-from typing import TYPE_CHECKING, Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from transformers import PegasusForConditionalGeneration, PreTrainedModel
 
@@ -25,10 +26,6 @@ from .pegasus_architecture import PegasusWrapper
 
 
 logger = get_logger()
-
-
-if TYPE_CHECKING:
-    from transformers import PreTrainedModel
 
 
 class RBLNPegasusModel(RBLNTransformerEncoderForFeatureExtraction):
@@ -69,3 +66,9 @@ class RBLNPegasusForConditionalGeneration(RBLNModelForSeq2SeqLM):
             return redirect(val)
 
         return val
+
+
+__all__ = [
+    "RBLNPegasusForConditionalGeneration",
+    "RBLNPegasusModel",
+]

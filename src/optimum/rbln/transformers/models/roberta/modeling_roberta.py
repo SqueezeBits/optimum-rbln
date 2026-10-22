@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Tuple, Union
 
 import torch
 from transformers.modeling_outputs import MaskedLMOutput, SequenceClassifierOutput
@@ -31,7 +30,7 @@ class RBLNRobertaForMaskedLM(RBLNModelForMaskedLM):
 
     rbln_model_input_names = ["input_ids", "attention_mask"]
 
-    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, **kwargs) -> Union[Tuple, MaskedLMOutput]:
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, **kwargs) -> tuple | MaskedLMOutput:
         """
         Forward pass for the RBLN-optimized RoBERTa model for masked language modeling tasks.
 
@@ -58,7 +57,7 @@ class RBLNRobertaForSequenceClassification(RBLNModelForSequenceClassification):
 
     def forward(
         self, input_ids: torch.Tensor, attention_mask: torch.Tensor, **kwargs
-    ) -> Union[Tuple, SequenceClassifierOutput]:
+    ) -> tuple | SequenceClassifierOutput:
         """
         Forward pass for the RBLN-optimized RoBERTa model for sequence classification tasks.
 
@@ -70,3 +69,9 @@ class RBLNRobertaForSequenceClassification(RBLNModelForSequenceClassification):
             The model outputs. If return_dict=False is passed, returns a tuple of tensors. Otherwise, returns a SequenceClassifierOutput object.
         """
         return super().forward(input_ids, attention_mask, **kwargs)
+
+
+__all__ = [
+    "RBLNRobertaForMaskedLM",
+    "RBLNRobertaForSequenceClassification",
+]

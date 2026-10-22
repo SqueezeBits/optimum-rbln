@@ -13,10 +13,11 @@
 # limitations under the License.
 
 from ...models.decoderonly import RBLNDecoderOnlyModelForCausalLM
+from ...utils.moe import RBLNMoeLoadMixin
 from .qwen3_moe_architecture import Qwen3MoeWrapper
 
 
-class RBLNQwen3MoeForCausalLM(RBLNDecoderOnlyModelForCausalLM):
+class RBLNQwen3MoeForCausalLM(RBLNMoeLoadMixin, RBLNDecoderOnlyModelForCausalLM):
     """
     The Qwen3 Moe is a Mixture-of-Experts (MoE) variant of Qwen3, available as a base model and an aligned chat model.
     This model inherits from [`RBLNDecoderOnlyModelForCausalLM`]. Check the superclass documentation for the generic methods the library implements for all its models.
@@ -37,13 +38,13 @@ class RBLNQwen3MoeForCausalLM(RBLNDecoderOnlyModelForCausalLM):
             "Qwen/Qwen3-30B-A3B-Thinking-2507",
             export=True,
             rbln_batch_size=1,
-            rbln_tensor_parallel_size=4,
+            rbln_num_devices=4,
         )
         # Using a config dictionary
         rbln_config = {
             "batch_size": 1,
             "max_seq_len": 262144,
-            "tensor_parallel_size": 4,
+            "num_devices": 4,
         }
         model = RBLNQwen3MoeForCausalLM.from_pretrained(
             "Qwen/Qwen3-30B-A3B-Thinking-2507",
@@ -55,7 +56,7 @@ class RBLNQwen3MoeForCausalLM(RBLNDecoderOnlyModelForCausalLM):
         config = RBLNQwen3MoeForCausalLMConfig(
             batch_size=1,
             max_seq_len=262144,
-            tensor_parallel_size=4
+            num_devices=4
         )
         model = RBLNQwen3MoeForCausalLM.from_pretrained(
             "Qwen/Qwen3-30B-A3B-Thinking-2507",
@@ -66,3 +67,8 @@ class RBLNQwen3MoeForCausalLM(RBLNDecoderOnlyModelForCausalLM):
     """
 
     _decoder_wrapper_cls = Qwen3MoeWrapper
+
+
+__all__ = [
+    "RBLNQwen3MoeForCausalLM",
+]

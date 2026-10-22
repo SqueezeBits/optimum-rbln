@@ -12,29 +12,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import types
+from collections.abc import Sequence
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union, get_args, get_origin, get_type_hints
+from typing import TYPE_CHECKING, Any, ClassVar, Union, get_args, get_origin, get_type_hints
 
 import rebel
 import torch
 from huggingface_hub.constants import HUGGINGFACE_HUB_CACHE
 from transformers import PretrainedConfig
 from transformers.modeling_outputs import BaseModelOutput
+from typing_extensions import Self
 
 from .configuration_utils import DEFAULT_COMPILED_MODEL_NAME, RBLNModelConfig
-from .modeling_base import RBLNBaseModel
+from .modeling_base import Preprocessor, RBLNBaseModel
 from .utils.logging import get_logger
 
 
 if TYPE_CHECKING:
-    from transformers import PreTrainedModel
+    from .modeling_base import HFModel
 
 
 logger = get_logger(__name__)
 
 
 class RBLNModel(RBLNBaseModel):
+    _output_class: ClassVar[type[Any] | None] = None
+
     @classmethod
     def update_kwargs(cls, kwargs):
         # Update user-given kwargs to get proper pytorch model.
@@ -44,11 +50,11 @@ class RBLNModel(RBLNBaseModel):
     @classmethod
     def save_torch_artifacts(
         cls,
-        model: "PreTrainedModel",
+        model: "HFModel",
         save_dir_path: Path,
         subfolder: str,
         rbln_config: RBLNModelConfig,
-    ):
+    ) -> None:
         # If you are unavoidably running on a CPU rather than an RBLN device,
         # store the torch tensor, weight, etc. in this function.
         pass
@@ -59,14 +65,16 @@ class RBLNModel(RBLNBaseModel):
         return model
 
     @classmethod
-    def get_compiled_model(cls, model: "PreTrainedModel", rbln_config: RBLNModelConfig):
+    def get_compiled_model(
+        cls, model: "HFModel", rbln_config: RBLNModelConfig
+    ) -> rebel.RBLNCompiledModel | dict[str, rebel.RBLNCompiledModel]:
         if rbln_config._allow_no_compile_cfgs:
             return {}
 
-        model = cls._wrap_model_if_needed(model, rbln_config)
+        wrapped_model = cls._wrap_model_if_needed(model, rbln_config)
         rbln_compile_config = rbln_config.compile_cfgs[0]
         compiled_model = cls.compile(
-            model,
+            wrapped_model,
             rbln_compile_config=rbln_compile_config,
             create_runtimes=rbln_config.create_runtimes,
             device=rbln_config.device,
@@ -76,38 +84,43 @@ class RBLNModel(RBLNBaseModel):
     @classmethod
     def _update_rbln_config(
         cls,
-        preprocessors: Optional[Any],
-        model: Optional["PreTrainedModel"] = None,
-        model_config: Optional["PretrainedConfig"] = None,
-        rbln_config: Optional[RBLNModelConfig] = None,
+        preprocessors: Sequence[Preprocessor] | None,
+        model: "HFModel",
+        model_config: "PretrainedConfig",
+        rbln_config: RBLNModelConfig,
     ) -> RBLNModelConfig:
         # Default implementation: return config as-is
         # Subclasses should override to set compile_cfgs if needed
         return rbln_config
 
     @classmethod
-    def _reconstruct_model_if_needed(cls, model: "PreTrainedModel"):
+    def update_rbln_config_using_pipe(cls, pipe: Any, rbln_config: RBLNModelConfig, submodule_name: str) -> Any:
+        raise NotImplementedError
+
+    @classmethod
+    def _reconstruct_model_if_needed(cls, model: "HFModel") -> "HFModel":
         return model
 
     @classmethod
     def from_model(
         cls,
-        model: "PreTrainedModel",
-        config: Optional[PretrainedConfig] = None,
-        rbln_config: Optional[Union[RBLNModelConfig, Dict]] = None,
-        model_save_dir: Optional[Union[str, Path, TemporaryDirectory]] = None,
+        model: "HFModel",
+        config: PretrainedConfig | None = None,
+        rbln_config: RBLNModelConfig | dict[str, Any] | None = None,
+        model_save_dir: str | os.PathLike[str] | TemporaryDirectory | None = None,
         subfolder: str = "",
         **kwargs: Any,
-    ) -> "RBLNModel":
+    ) -> Self:
         """
         Converts and compiles a pre-trained HuggingFace library model into a RBLN model.
         This method performs the actual model conversion and compilation process.
 
         Args:
-            model (PreTrainedModel): The PyTorch model to be compiled.
-                The object must be an instance of the HuggingFace transformers PreTrainedModel class.
-            config (Optional[PretrainedConfig]): The configuration object associated with the model.
-            rbln_config (Optional[Union[RBLNModelConfig, Dict]]): Configuration for RBLN model compilation and runtime.
+            model (PreTrainedModel | ModelMixin): The PyTorch model to be compiled.
+                The object must be a HuggingFace transformers `PreTrainedModel` or a Diffusers component based on
+                `diffusers.ModelMixin`, such as a VAE, UNet or ControlNet.
+            config (PretrainedConfig | None): The configuration object associated with the model.
+            rbln_config (RBLNModelConfig | dict | None): Configuration for RBLN model compilation and runtime.
                 This can be provided as a dictionary or an instance of the model's configuration class (e.g., `RBLNLlamaForCausalLMConfig` for Llama models).
                 For detailed configuration options, see the specific model's configuration class documentation.
             kwargs: Additional keyword arguments. Arguments with the prefix `rbln_` are passed to rbln_config, while the remaining arguments are passed to the HuggingFace library.
@@ -128,20 +141,20 @@ class RBLNModel(RBLNBaseModel):
         rbln_config, kwargs = cls.prepare_rbln_config(rbln_config=rbln_config, **kwargs)
 
         # Directory to save compile artifacts(.rbln) and original configs
+        save_dir: str | os.PathLike[str] | TemporaryDirectory
         if model_save_dir is None:
             save_dir = TemporaryDirectory()
             save_dir_path = Path(save_dir.name)
         else:
             save_dir = model_save_dir
             if isinstance(save_dir, TemporaryDirectory):
-                save_dir_path = Path(model_save_dir.name)
+                save_dir_path = Path(save_dir.name)
             else:
-                save_dir_path = Path(model_save_dir)
+                save_dir_path = Path(save_dir)
                 save_dir_path.mkdir(exist_ok=True)
 
         # Save configs
-        if config is None:
-            config = model.config
+        raw_config: Any = model.config if config is None else config
 
         if hasattr(model, "can_generate") and model.can_generate():
             import json
@@ -154,8 +167,17 @@ class RBLNModel(RBLNBaseModel):
             local_config["transformers_version"] = generation_config.transformers_version
             generation_config_path.write_text(json.dumps(local_config, indent=2) + "\n", encoding="utf-8")
 
-        if not isinstance(config, PretrainedConfig):  # diffusers config
-            config = PretrainedConfig(**config)
+        if isinstance(raw_config, PretrainedConfig):
+            config = raw_config
+        else:  # diffusers config
+            config_dict = dict(raw_config)
+            model_type = config_dict.pop("model_type", None)
+            if model_type:
+                from transformers import AutoConfig
+
+                config = AutoConfig.for_model(model_type, **config_dict)
+            else:
+                config = PretrainedConfig(**config_dict)
 
         # Save preprocessor
         for preprocessor in preprocessors:
@@ -168,26 +190,23 @@ class RBLNModel(RBLNBaseModel):
                 model_save_dir=save_dir,
                 rbln_config=rbln_config,
                 preprocessors=preprocessors,
+                parent_subfolder=subfolder,
                 **kwargs,
             )
         else:
             rbln_submodules = []
 
         # Get compilation arguments (e.g. input_info)
-        rbln_config: RBLNModelConfig = cls.update_rbln_config(
+        rbln_config = cls.update_rbln_config(
             preprocessors=preprocessors, model=model, model_config=config, rbln_config=rbln_config
         )
 
-        # torchscript should be True for jit to work
-        torchscript_backup = config.torchscript
-        config.torchscript = True
-
-        compiled_model: Union[rebel.RBLNCompiledModel, Dict[str, rebel.RBLNCompiledModel]] = cls.get_compiled_model(
+        compiled_model: rebel.RBLNCompiledModel | dict[str, rebel.RBLNCompiledModel] = cls.get_compiled_model(
             model, rbln_config=rbln_config
         )
 
         # Save compiled models (.rbln)
-        (save_dir_path / subfolder).mkdir(exist_ok=True)
+        (save_dir_path / subfolder).mkdir(parents=True, exist_ok=True)
         if not isinstance(compiled_model, dict):
             compiled_models = {DEFAULT_COMPILED_MODEL_NAME: compiled_model}
         else:
@@ -196,7 +215,6 @@ class RBLNModel(RBLNBaseModel):
             cm.save(save_dir_path / subfolder / f"{compiled_model_name}.rbln")
         rbln_config.save(save_dir_path / subfolder)
 
-        config.torchscript = torchscript_backup
         config.save_pretrained(save_dir_path / subfolder)
 
         # Save torch artifacts (e.g. embedding matrix if needed.)
@@ -217,26 +235,36 @@ class RBLNModel(RBLNBaseModel):
     @classmethod
     def get_pytorch_model(
         cls,
-        model_id: str,
-        use_auth_token: Optional[Union[bool, str]] = None,
-        revision: Optional[str] = None,
+        model_id: str | Path,
+        token: bool | str | None = None,
+        revision: str | None = None,
         force_download: bool = False,
-        cache_dir: Optional[str] = HUGGINGFACE_HUB_CACHE,
+        cache_dir: str | None = HUGGINGFACE_HUB_CACHE,
         subfolder: str = "",
         local_files_only: bool = False,
         trust_remote_code: bool = False,
         # Some rbln-config should be applied before loading torch module (i.e. quantized llm)
-        rbln_config: Optional[RBLNModelConfig] = None,
+        rbln_config: RBLNModelConfig | None = None,
         **kwargs,
-    ) -> "PreTrainedModel":
+    ) -> "HFModel":
         kwargs = cls.update_kwargs(kwargs)
 
-        return cls.get_hf_class().from_pretrained(
+        # transformers v5 defaults dtype to "auto", which loads checkpoints in
+        # their native bf16/fp16. If the caller didn't pin a dtype, fall back
+        # to fp32 for models whose RBLN wrappers don't support non-fp32 weights.
+        if not cls._supports_non_fp32 and "dtype" not in kwargs and "torch_dtype" not in kwargs:
+            kwargs["torch_dtype"] = torch.float32
+
+        hf_class = cls.get_hf_class()
+        if hf_class is None:
+            raise ValueError(f"Could not find the HuggingFace class corresponding to {cls.__name__}.")
+
+        return hf_class.from_pretrained(
             model_id,
             subfolder=subfolder,
             revision=revision,
             cache_dir=cache_dir,
-            use_auth_token=use_auth_token,
+            token=token,
             local_files_only=local_files_only,
             force_download=force_download,
             trust_remote_code=trust_remote_code,
@@ -246,9 +274,9 @@ class RBLNModel(RBLNBaseModel):
     @classmethod
     def _create_runtimes(
         cls,
-        compiled_models: List[rebel.RBLNCompiledModel],
+        compiled_models: list[rebel.RBLNCompiledModel],
         rbln_config: RBLNModelConfig,
-    ) -> List[rebel.Runtime]:
+    ) -> list[rebel.Runtime]:
         if len(rbln_config.compile_cfgs) == 0:
             return []
 
@@ -266,7 +294,7 @@ class RBLNModel(RBLNBaseModel):
             for compiled_model in compiled_models
         ]
 
-    def forward(self, *args: Any, return_dict: Optional[bool] = None, **kwargs: Any) -> Any:
+    def forward(self, *args: Any, return_dict: bool | None = None, **kwargs: Any) -> Any:
         """
         Defines the forward pass of `RBLNModel`. The interface mirrors HuggingFace conventions so it can act as a drop-in
         replacement in many cases.
@@ -282,7 +310,7 @@ class RBLNModel(RBLNBaseModel):
                 transformers models, or sample, timestep for diffusers models).
             return_dict:
                 Whether to return outputs as a dictionary-like object or as a tuple. When `None`:
-                - For transformers models: Uses `self.config.use_return_dict` (typically `True`)
+                - For transformers models: Uses `self.config.return_dict` (typically `True`)
                 - For diffusers models: Defaults to `True`
             kwargs: Arbitrary keyword arguments containing additional model inputs and parameters,
                 matching the original HuggingFace model's interface.
@@ -301,7 +329,7 @@ class RBLNModel(RBLNBaseModel):
             - Can be used directly in HuggingFace pipelines, transformers.Trainer, and other workflows
         """
         if self.hf_library_name == "transformers":
-            return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+            return_dict = return_dict if return_dict is not None else self.config.return_dict
         else:
             return_dict = True if return_dict is None else return_dict
 
@@ -312,10 +340,11 @@ class RBLNModel(RBLNBaseModel):
         return self._prepare_output(output, return_dict)
 
     @classmethod
-    def get_hf_output_class(cls):
+    def get_hf_output_class(cls) -> type[Any]:
         # Dynamically gets the output class from the corresponding HuggingFace model class.
-        if "_output_class" in cls.__dict__ and cls._output_class is not None:
-            return cls._output_class
+        output_class: type[Any] | None = cls.__dict__.get("_output_class")
+        if output_class is not None:
+            return output_class
 
         hf_class = cls.get_hf_class()
         if hf_class is None:
@@ -325,7 +354,9 @@ class RBLNModel(RBLNBaseModel):
         ret = hints.get("return")
 
         if ret is not None:
-            candidates = get_args(ret) if get_origin(ret) is Union else (ret,)
+            origin = get_origin(ret)
+            is_union = origin is Union or origin is types.UnionType
+            candidates = get_args(ret) if is_union else (ret,)
 
             for t in candidates:
                 if t is type(None):  # Skip NoneType in Union
@@ -348,7 +379,7 @@ class RBLNModel(RBLNBaseModel):
         else:
             output_class = self.get_hf_output_class()
             if hasattr(output_class, "loss"):
-                tuple_output = (None,) + tuple_output
+                tuple_output = (None, *tuple_output)
 
             # Truncate if we have too many outputs, otherwise use as is
             if hasattr(output_class, "__annotations__"):
@@ -362,3 +393,9 @@ class RBLNModel(RBLNBaseModel):
                     )
 
             return output_class(*tuple_output)
+
+
+__all__ = [
+    "RBLNBaseModel",
+    "RBLNModel",
+]

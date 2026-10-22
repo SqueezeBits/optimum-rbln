@@ -1,15 +1,22 @@
-import math
-from typing import Tuple
-
 import torch
-import torch.nn as nn
+from torch import nn
 from transformers import PreTrainedModel
 
 from ..decoderonly.decoderonly_architecture import (
     DecoderOnlyWrapper,
-    apply_rotary_pos_emb,
+    rotate_half,
 )
 from .configuration_qwen2_vl import RBLNQwen2VisionTransformerPretrainedModelConfig
+
+
+def apply_rotary_pos_emb_vision(q, k, cos, sin):
+    # Mirrors HF `apply_rotary_pos_emb_vision`: rotate in fp32 and round once.
+    orig_q_dtype, orig_k_dtype = q.dtype, k.dtype
+    q, k = q.float(), k.float()
+    cos, sin = cos.float(), sin.float()
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed.to(orig_q_dtype), k_embed.to(orig_k_dtype)
 
 
 class Qwen2VisionTransformerWrapper(nn.Module):
@@ -58,7 +65,7 @@ class Qwen2VLVisionBlock(torch.nn.Module):
         self,
         hidden_states: torch.Tensor,
         attn_masks: torch.Tensor,
-        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         hidden_states = hidden_states + self.attn(
             self.norm1(hidden_states),
@@ -78,13 +85,13 @@ class VisionAttention(nn.Module):
         self.head_dim = getattr(model, "head_dim", model.proj.in_features // model.num_heads)
         self.qkv = model.qkv
         self.proj = model.proj
-        self.scale = torch.tensor(1 / math.sqrt(self.head_dim), dtype=rbln_config.dtype)
+        self.scale = self.head_dim**-0.5
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         attn_masks: torch.Tensor,
-        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         seq_length = hidden_states.shape[0]
         hidden_states = hidden_states.unsqueeze(0)
@@ -93,11 +100,12 @@ class VisionAttention(nn.Module):
         )
 
         cos, sin = position_embeddings
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
 
         attn_weights = torch.matmul(q, k.transpose(2, 3)) * self.scale
         attn_weights = attn_weights + attn_masks
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1)
+        # HF eager attention: softmax in fp32, probabilities back in the query dtype.
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
         attn_output = torch.matmul(attn_weights, v)
         attn_output = attn_output.transpose(1, 2)
         attn_output = attn_output.reshape(1, seq_length, -1)
@@ -108,10 +116,10 @@ class VisionAttention(nn.Module):
 
 class Qwen2VL_LanguageModelWrapper(DecoderOnlyWrapper):
     def get_decoder_layers(self, model: PreTrainedModel):
-        return model.model.language_model.layers if hasattr(model, "model") else model.language_model.layers
+        return model.get_decoder().layers
 
     def get_model_layer(self, model: PreTrainedModel):
-        return model.model.language_model if hasattr(model, "model") else model.language_model
+        return model.get_decoder()
 
     def prepare_forward_args(self, *args):
         args = list(args)
@@ -135,7 +143,7 @@ class Qwen2VL_LanguageModelWrapper(DecoderOnlyWrapper):
         # [key, value] * n_layer -> ( (key, value) ) * n_layer
         # cache shape : batch, n_heads, 1, max_seq_len, head_dim
         _past_key_values = []
-        for i in range(self.config.num_hidden_layers):
+        for i in range(self.num_hidden_layers):
             key_states = past_key_values[i * 2]
             value_states = past_key_values[i * 2 + 1]
             past_key_value = [key_states, value_states]

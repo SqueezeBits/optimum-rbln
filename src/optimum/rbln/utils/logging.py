@@ -35,11 +35,13 @@ import logging
 import os
 import sys
 import threading
-from typing import Optional
+from typing import cast
+
+from transformers._typing import TransformersLogger
 
 
 _lock = threading.Lock()
-_default_handler: Optional[logging.Handler] = None
+_default_handler: logging.Handler | None = None
 
 
 log_levels = {
@@ -75,18 +77,17 @@ def _get_library_root_logger() -> logging.Logger:
 
 
 def _configure_library_root_logger() -> None:
-    global _default_handler
+    global _default_handler  # noqa: PLW0603
 
     with _lock:
         if _default_handler:
             # This library has already configured the library root logger.
             return
-        _default_handler = logging.StreamHandler()  # Set sys.stderr as stream.
         # set defaults based on https://github.com/pyinstaller/pyinstaller/issues/7334#issuecomment-1357447176
         if sys.stderr is None:
-            sys.stderr = open(os.devnull, "w")
+            sys.stderr = open(os.devnull, "w")  # noqa: SIM115
 
-        _default_handler.flush = sys.stderr.flush
+        _default_handler = logging.StreamHandler(sys.stderr)
 
         # Apply our default configuration to the library root logger.
         library_root_logger = _get_library_root_logger()
@@ -98,7 +99,7 @@ def _configure_library_root_logger() -> None:
         library_root_logger.propagate = False
 
 
-def get_logger(name: Optional[str] = None) -> logging.Logger:
+def get_logger(name: str | None = None) -> TransformersLogger:
     """
     Return a logger with the specified name.
     """
@@ -107,4 +108,4 @@ def get_logger(name: Optional[str] = None) -> logging.Logger:
         name = _get_library_name()
 
     _configure_library_root_logger()
-    return logging.getLogger(name)
+    return cast(TransformersLogger, logging.getLogger(name))
