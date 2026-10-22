@@ -38,7 +38,8 @@ dependencies = [
     "torchcodec==0.16.0+cpu; platform_machine == 'x86_64' and platform_python_implementation == 'CPython'",
     "accelerate>=1.0.1",
     "transformers==5.15.1",
-    "diffusers==0.41.0",
+    "diffusers==0.41.0; python_full_version < '3.11'",
+    "diffusers==0.42.1; python_full_version >= '3.11'",  # FLUX.3 and Qwen-Image 2.1 (experimental) need 0.42
     "packaging>=24.1",
     "typing-extensions>=4.5",
     "tokenizers==0.22.1",
@@ -209,6 +210,9 @@ module = [
     "optimum.rbln.transformers.models.*",
     "optimum.rbln.diffusers.models.*",
     "optimum.rbln.diffusers.pipelines.*",
+    "optimum.rbln.experimental.transformers.models.*",
+    "optimum.rbln.experimental.diffusers.models.*",
+    "optimum.rbln.experimental.diffusers.pipelines.*",
 ]
 disable_error_code = [
     "arg-type",

@@ -24,6 +24,7 @@ from .utils.import_utils import define_import_structure
 if TYPE_CHECKING:
     from .configuration_utils import *
     from .diffusers import *
+    from .experimental import *
     from .modeling import *
     from .transformers import *
 else:
