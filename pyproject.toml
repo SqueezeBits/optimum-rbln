@@ -209,6 +209,9 @@ module = [
     "optimum.rbln.transformers.models.*",
     "optimum.rbln.diffusers.models.*",
     "optimum.rbln.diffusers.pipelines.*",
+    "optimum.rbln.experimental.transformers.models.*",
+    "optimum.rbln.experimental.diffusers.models.*",
+    "optimum.rbln.experimental.diffusers.pipelines.*",
 ]
 disable_error_code = [
     "arg-type",
