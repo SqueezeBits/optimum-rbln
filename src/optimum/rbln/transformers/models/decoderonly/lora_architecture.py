@@ -26,6 +26,7 @@ class LoRALinear(nn.Module):
         lora_config: RBLNLoRAConfig,
         projection_name: str = "",
         layer_idx: int = 0,
+        module_path: str | None = None,
     ):
         """
         Args:
@@ -33,6 +34,9 @@ class LoRALinear(nn.Module):
             lora_config: LoRA configuration containing all adapters
             projection_name: Name of the projection (e.g., "q_proj", "k_proj")
             layer_idx: Layer index for loading the correct LoRA weights
+            module_path: Path of the projection in the adapter's base model, for a projection outside
+                `self_attn` and `mlp` (e.g., "lm_head", "model.layers.0.linear_attn.out_proj"). Defaults to
+                `model.layers.{layer_idx}.{self_attn|mlp}.{projection_name}`.
         """
         super().__init__()
 
@@ -40,6 +44,7 @@ class LoRALinear(nn.Module):
         self.out_features = original_linear.out_features
         self.projection_name = projection_name
         self.layer_idx = layer_idx
+        self.module_path = module_path
         self.lora_config = lora_config
 
         # Store original linear weights and bias directly without cloning
@@ -83,7 +88,12 @@ class LoRALinear(nn.Module):
         for filename, load_fn in weight_files:
             weight_path = adapter_path / filename
             if weight_path.exists():
-                return load_fn(weight_path)
+                # An adapter trained on a vision-language model names the text decoder `model.language_model`;
+                # the decoder compiled here is addressed as `model`.
+                return {
+                    key.replace("base_model.model.model.language_model.", "base_model.model.model."): value
+                    for key, value in load_fn(weight_path).items()
+                }
 
         raise FileNotFoundError(
             f"No adapter weights found in {adapter_path}. "
@@ -105,17 +115,20 @@ class LoRALinear(nn.Module):
 
             adapter_weights = self._load_adapter_weights(adapter.local_adapter_path)
 
-            # Determine module type from projection name
-            attn_projs = {"q_proj", "k_proj", "v_proj", "o_proj"}
-            mlp_projs = {"gate_proj", "up_proj", "down_proj"}
-            if self.projection_name in attn_projs:
-                module_type = "self_attn"
-            elif self.projection_name in mlp_projs:
-                module_type = "mlp"
+            if self.module_path is not None:
+                layer_key = f"base_model.model.{self.module_path}"
             else:
-                module_type = "self_attn"
+                # Determine module type from projection name
+                attn_projs = {"q_proj", "k_proj", "v_proj", "o_proj"}
+                mlp_projs = {"gate_proj", "up_proj", "down_proj"}
+                if self.projection_name in attn_projs:
+                    module_type = "self_attn"
+                elif self.projection_name in mlp_projs:
+                    module_type = "mlp"
+                else:
+                    module_type = "self_attn"
 
-            layer_key = f"base_model.model.model.layers.{self.layer_idx}.{module_type}.{self.projection_name}"
+                layer_key = f"base_model.model.model.layers.{self.layer_idx}.{module_type}.{self.projection_name}"
             lora_a_key = f"{layer_key}.lora_A.weight"
             lora_b_key = f"{layer_key}.lora_B.weight"
 

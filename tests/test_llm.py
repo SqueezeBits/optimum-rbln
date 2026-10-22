@@ -9,7 +9,7 @@ import warnings
 import pytest
 import torch
 from PIL import Image
-from safetensors.torch import save_file
+from safetensors.torch import load, save_file
 from transformers import (
     AutoConfig,
     AutoProcessor,
@@ -340,6 +340,111 @@ class TestQwen3_5ForCausalLM(LLMTest.TestLLM):
         config.layer_types = ["linear_attention", "linear_attention", "linear_attention", "full_attention"]
         cls.HF_CONFIG_KWARGS.update({"config": config, "ignore_mismatched_sizes": True})
         return super().setUpClass()
+
+
+class TestQwen3_5ForCausalLM_LoRA(TestQwen3_5ForCausalLM):
+    # A random adapter on every projection Qwen3.5 adapters train (GatedDeltaNet, gated attention, MLP and the LM
+    # head), saved with the vision-language key names (`model.language_model.*`) that Qwen3.5 checkpoints use.
+    HF_CONFIG_KWARGS = {}
+    TARGET_MODULES = [
+        "in_proj_qkv",
+        "in_proj_z",
+        "in_proj_b",
+        "in_proj_a",
+        "out_proj",
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+        "lm_head",
+    ]
+    LORA_RANK = 8
+    LORA_ALPHA = 16
+
+    @classmethod
+    def setUpClass(cls):
+        if os.environ.get("REUSE_ARTIFACTS_PATH") is not None:
+            # The compiled config points at this run's temporary adapter directory.
+            raise unittest.SkipTest("The adapter is generated per run; there is no artifact to reuse.")
+        cls.adapter_dir = tempfile.TemporaryDirectory()
+        config = AutoConfig.from_pretrained(cls.HF_MODEL_ID).get_text_config()
+        config.num_hidden_layers = 4
+        config.layer_types = ["linear_attention", "linear_attention", "linear_attention", "full_attention"]
+        hf_model = Qwen3_5ForCausalLM.from_pretrained(cls.HF_MODEL_ID, config=config, ignore_mismatched_sizes=True)
+        generator = torch.manual_seed(0)
+        weights = {}
+        for name, module in hf_model.named_modules():
+            if isinstance(module, torch.nn.Linear) and name.split(".")[-1] in cls.TARGET_MODULES:
+                key = "base_model.model." + name.replace("model.layers.", "model.language_model.layers.")
+                lora_a = torch.randn(cls.LORA_RANK, module.in_features, generator=generator) / module.in_features**0.5
+                lora_b = 0.02 * torch.randn(module.out_features, cls.LORA_RANK, generator=generator)
+                weights[f"{key}.lora_A.weight"] = lora_a
+                weights[f"{key}.lora_B.weight"] = lora_b
+        save_file(weights, os.path.join(cls.adapter_dir.name, "adapter_model.safetensors"))
+        adapter_config = {
+            "peft_type": "LORA",
+            "r": cls.LORA_RANK,
+            "lora_alpha": cls.LORA_ALPHA,
+            "target_modules": cls.TARGET_MODULES,
+            "bias": "none",
+        }
+        with open(os.path.join(cls.adapter_dir.name, "adapter_config.json"), "w") as f:
+            json.dump(adapter_config, f)
+        cls.RBLN_CLASS_KWARGS = {
+            "rbln_config": {
+                "num_devices": 1,
+                "max_seq_len": 8192,
+                "kvcache_partition_len": 4096,
+                "lora_config": {"adapters": [RBLNLoRAAdapterConfig(1, "random", cls.adapter_dir.name)]},
+            }
+        }
+        return super().setUpClass()
+
+    @classmethod
+    def tearDownClass(cls):
+        super().tearDownClass()
+        cls.adapter_dir.cleanup()
+
+    def get_inputs(self):
+        self.model.set_adapter("random")
+        return super().get_inputs()
+
+    def merged_hf_model(self):
+        # transformers with W += (alpha / r) * B @ A, as peft's merge_and_unload. The LM head is untied first: the
+        # adapter changes the output projection, not the input embeddings.
+        hf_model = Qwen3_5ForCausalLM.from_pretrained(self.HF_MODEL_ID, **self.HF_CONFIG_KWARGS, dtype=torch.float32)
+        hf_model.lm_head.weight = torch.nn.Parameter(hf_model.lm_head.weight.detach().clone())
+        with open(os.path.join(self.adapter_dir.name, "adapter_model.safetensors"), "rb") as f:
+            weights = load(f.read())
+        scale = self.LORA_ALPHA / self.LORA_RANK
+        with torch.no_grad():
+            for name, module in hf_model.named_modules():
+                key = "base_model.model." + name.replace("model.layers.", "model.language_model.layers.")
+                if f"{key}.lora_A.weight" in weights:
+                    delta = weights[f"{key}.lora_B.weight"] @ weights[f"{key}.lora_A.weight"]
+                    module.weight += scale * delta
+        return hf_model
+
+    def test_adapter_matches_merged_hf(self):
+        if os.environ.get("REUSE_ARTIFACTS_PATH") is not None:
+            return
+        text = "The quick brown fox jumps over the lazy dog, and the dog chases the fox back home. " * 4
+        input_ids = self.get_tokenizer()(text, return_tensors="pt", add_special_tokens=False)["input_ids"]
+        base_model = Qwen3_5ForCausalLM.from_pretrained(self.HF_MODEL_ID, **self.HF_CONFIG_KWARGS, dtype=torch.float32)
+        logits = {}
+        for adapter, hf_model in (("base", base_model), ("random", self.merged_hf_model())):
+            with torch.no_grad():
+                expected = hf_model(input_ids=input_ids).logits[0, -1].float()
+            self.model.set_adapter(adapter)
+            output = self.model(input_ids=input_ids)
+            logits[adapter] = (output.logits if hasattr(output, "logits") else output[0])[0, -1].float()
+            cos = torch.nn.functional.cosine_similarity(logits[adapter], expected, dim=0).item()
+            assert cos > 0.99, f"{adapter}: last-token logits drifted from transformers (cosine {cos:.4f})"
+        # The adapter must actually change the output for the check above to mean anything.
+        assert torch.nn.functional.cosine_similarity(logits["base"], logits["random"], dim=0).item() < 0.99
 
 
 class TestQwen3_5ForCausalLM_Eager(TestQwen3_5ForCausalLM):
