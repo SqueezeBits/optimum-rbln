@@ -113,6 +113,12 @@ class RBLNQwen3_5RuntimeModel(RBLNRuntimeModel):
         )
 
         chunk = self.rbln_config.prefill_chunk_size
+        if query_length > chunk and self.rbln_config._is_prefix_lm:
+            raise ValueError(
+                f"Input length ({query_length}) exceeds `prefill_chunk_size` ({chunk}). This model prefills with "
+                "bidirectional attention over the whole input, which therefore must fit in a single prefill chunk. "
+                "Compile the model with `prefill_chunk_size` >= the maximum input length."
+            )
         # NOTE: Prefix caching is not supported yet: carrying the linear (GatedDeltaNet) conv/recurrent state
         # across a cached prefix isn't implemented.
         prefix_cached_len = cache_position[0][0].item()
@@ -134,7 +140,10 @@ class RBLNQwen3_5RuntimeModel(RBLNRuntimeModel):
             )
 
             # Reveal the current chunk (and previously seen tokens) in the causal attention mask.
-            if self.rbln_config.use_attention_mask:
+            if self.rbln_config.use_attention_mask and self.rbln_config.use_position_ids:
+                # Bidirectional prefill: a key mask; every valid token of the window sees every other one.
+                chunked_attention_mask[:, step : min(step + chunk, query_length)] = 1
+            elif self.rbln_config.use_attention_mask:
                 if step > 0:
                     chunked_attention_mask[:, :, :, prefix_cached_len : prefix_cached_len + step] = 1
                 chunked_attention_mask[:, :, :, step + prefix_cached_len : step + prefix_cached_len + chunk] = (
@@ -157,6 +166,8 @@ class RBLNQwen3_5RuntimeModel(RBLNRuntimeModel):
                 named["query_position"] = query_position
             if self.rbln_config.use_attention_mask:
                 named["attention_mask"] = chunked_attention_mask
+            if self.rbln_config.use_position_ids:
+                named["position_ids"] = position_ids[:, step : step + chunk]
             if self.rbln_config.use_lora:
                 named["lora_int_ids"] = lora_int_ids
 
