@@ -608,6 +608,8 @@ class Qwen3_5Model(DecoderOnlyModel):
                 seq_positions=cache_position[:, 0], max_seq_len=self.max_seq_len
             )
         else:
+            # The runtime right-pads the last prefill window's cache_position with zeros, so the window start is
+            # its first position; the minimum would be 0 and write the window over the start of the cache.
             seq_positions = cache_position[:, :1]
 
         all_hidden_states = () if output_hidden_states else None
