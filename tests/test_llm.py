@@ -433,6 +433,56 @@ class TestQwen3_5TextModel(LLMTest.TestLLMWithoutLMHead):
                 assert cos.min() > 0.99, f"hidden states drifted from transformers (min cosine {cos.min():.4f})"
 
 
+class TestQwen3_5TextModel_Bidirectional(TestQwen3_5TextModel):
+    # Bidirectional prefill (use_attention_mask + use_position_ids), as in encoders built on Qwen3.5: the
+    # full-attention layers see the whole prompt in both directions, the GatedDeltaNet layers keep their causal scan.
+    # The prompt must fit one window; prefill_chunk_size defaults to max_seq_len.
+    RBLN_CLASS_KWARGS = {
+        "rbln_config": {"num_devices": 1, "max_seq_len": 1024, "use_attention_mask": True, "use_position_ids": True}
+    }
+    HF_CONFIG_KWARGS = {}
+
+    @staticmethod
+    def bidirectional_hidden_states(hf_model, input_ids):
+        # transformers runs Qwen3.5 causally. This is the same forward with a key mask only on the full-attention
+        # layers (each token sees every token), for one unpadded row.
+        length = input_ids.shape[1]
+        hidden_states = hf_model.embed_tokens(input_ids)
+        positions = torch.arange(length).view(1, 1, -1).expand(4, 1, -1)
+        position_embeddings = hf_model.rotary_emb(hidden_states, positions[1:])
+        keys = torch.ones(1, 1, 1, length, dtype=torch.bool)
+        for layer, layer_type in zip(hf_model.layers, hf_model.config.layer_types, strict=True):
+            hidden_states = layer(
+                hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=keys if layer_type == "full_attention" else None,
+                position_ids=positions[0],
+                past_key_values=None,
+                use_cache=False,
+            )
+        return hf_model.norm(hidden_states)
+
+    def test_last_hidden_state_matches_hf(self):
+        if os.environ.get("REUSE_ARTIFACTS_PATH") is not None:
+            return
+        hf_model = Qwen3_5TextModel.from_pretrained(
+            self.HF_MODEL_ID, **self.HF_CONFIG_KWARGS, dtype=torch.float32, attn_implementation="sdpa"
+        )
+        text = "The quick brown fox jumps over the lazy dog, and the dog chases the fox back home. " * 80
+        ids = self.get_tokenizer()(text, return_tensors="pt", add_special_tokens=False)["input_ids"]
+        for length in (300, self.model.rbln_config.prefill_chunk_size):
+            with self.subTest(length=length):
+                input_ids = ids[:, :length]
+                with torch.no_grad():
+                    expected = self.bidirectional_hidden_states(hf_model, input_ids).float()
+                    causal = hf_model(input_ids=input_ids).last_hidden_state.float()
+                output = self.model(input_ids=input_ids).last_hidden_state.float()
+                cos = torch.nn.functional.cosine_similarity(output, expected, dim=-1)
+                assert cos.min() > 0.99, f"hidden states drifted from transformers (min cosine {cos.min():.4f})"
+                # Only meaningful if a causal prefill fails the same check.
+                assert torch.nn.functional.cosine_similarity(output, causal, dim=-1).min() < 0.99
+
+
 class TestOPTForCausalLM(LLMTest.TestLLM):
     RBLN_CLASS = RBLNOPTForCausalLM
     HF_MODEL_ID = "facebook/opt-2.7b"

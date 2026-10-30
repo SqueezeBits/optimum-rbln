@@ -210,6 +210,17 @@ class RBLNQwen3_5TextModel(RBLNDecoderOnlyModel):
     @classmethod
     def _update_rbln_config(cls, preprocessors=None, model=None, model_config=None, rbln_config=None):
         rbln_config.linear_attention_layers = _qwen3_5_linear_layer_indices(model_config)
+        if rbln_config.use_position_ids and rbln_config.can_generate:
+            # Bidirectional prefill (use_attention_mask + use_position_ids) is wired for prefill only: the decode
+            # runtime builds no position_ids or 2D key mask.
+            raise NotImplementedError(
+                "use_position_ids (bidirectional prefill) is supported only for prefill-only Qwen3.5 text models; "
+                'set phases=["prefill"].'
+            )
+        if rbln_config.use_position_ids:
+            # Declared before the attention defaults: the prompt must fit one prefill chunk (defaults to
+            # max_seq_len) and the full-attention layers compile with is_bidirectional.
+            rbln_config._is_prefix_lm = True
         rbln_config = super()._update_rbln_config(
             preprocessors=preprocessors, model=model, model_config=model_config, rbln_config=rbln_config
         )
@@ -219,11 +230,6 @@ class RBLNQwen3_5TextModel(RBLNDecoderOnlyModel):
     @classmethod
     def get_input_info(cls, batch_size, query_length, rbln_config, model_config: PretrainedConfig):
         text_config = model_config.get_text_config()
-        if rbln_config.use_position_ids:
-            # Qwen3.5 needs no explicit position_ids: the VL path precomputes the mRoPE cos/sin on the
-            # host and feeds them as position_emb, and the Text Model path derives contiguous positions from
-            # cache_position (mRoPE degenerates to standard RoPE for text-only).
-            raise NotImplementedError("use_position_ids is not supported for the Qwen3.5 model.")
         num_attention_heads = getattr(text_config, "n_head", None) or text_config.num_attention_heads
         num_key_value_heads = getattr(text_config, "num_key_value_heads", None) or num_attention_heads
         num_hidden_layers = getattr(text_config, "n_layer", None) or text_config.num_hidden_layers
@@ -256,9 +262,15 @@ class RBLNQwen3_5TextModel(RBLNDecoderOnlyModel):
             input_info.append(("query_position", [], "int16"))
 
         if rbln_config.use_attention_mask:
-            input_info.append(
-                ("attention_mask", [batch_size, 1, query_length, rbln_config.max_seq_len], rbln_config.dtype)
-            )
+            if rbln_config.use_position_ids:
+                # Bidirectional prefill: a key mask over the cache; the window attends both ways.
+                input_info.append(("attention_mask", [batch_size, rbln_config.max_seq_len], rbln_config.dtype))
+            else:
+                input_info.append(
+                    ("attention_mask", [batch_size, 1, query_length, rbln_config.max_seq_len], rbln_config.dtype)
+                )
+        if rbln_config.use_position_ids:
+            input_info.append(("position_ids", [batch_size, query_length], "int32"))
         if rbln_config.use_lora:
             input_info.append(("lora_int_ids", [batch_size], "int32"))
 
@@ -628,6 +640,9 @@ class RBLNQwen3_5Model(RBLNDecoderOnlyModel):
     @classmethod
     def _update_rbln_config(cls, preprocessors=None, model=None, model_config=None, rbln_config=None):
         rbln_config.linear_attention_layers = _qwen3_5_linear_layer_indices(model_config)
+        if rbln_config.use_position_ids:
+            # The vision-language path precomputes the mRoPE cos/sin on the host and feeds them as position_emb.
+            raise NotImplementedError("use_position_ids is not supported for the Qwen3.5 vision-language model.")
         rbln_config = super()._update_rbln_config(
             preprocessors=preprocessors, model=model, model_config=model_config, rbln_config=rbln_config
         )
