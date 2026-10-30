@@ -21,6 +21,8 @@ from transformers import (
     Qwen2MoeConfig,
     Qwen2MoeForCausalLM,
     Qwen3_5ForCausalLM,
+    Qwen3_5MoeForCausalLM,
+    Qwen3_5MoeTextConfig,
     Qwen3MoeConfig,
     Qwen3MoeForCausalLM,
     Qwen3VLMoeConfig,
@@ -73,6 +75,9 @@ from optimum.rbln import (
     RBLNQwen2VLForConditionalGeneration,
     RBLNQwen3_5ForCausalLM,
     RBLNQwen3_5ForConditionalGeneration,
+    RBLNQwen3_5MoeForCausalLM,
+    RBLNQwen3_5MoeForCausalLMConfig,
+    RBLNQwen3_5MoeForConditionalGeneration,
     RBLNQwen3ASRForConditionalGeneration,
     RBLNQwen3ForCausalLM,
     RBLNQwen3Model,
@@ -365,6 +370,27 @@ class TestQwen3_5ForCausalLM_Eager(TestQwen3_5ForCausalLM):
                 logits = (output.logits if hasattr(output, "logits") else output[0])[0, -1].float()
                 cos = torch.nn.functional.cosine_similarity(logits, expected, dim=0).item()
                 assert cos > 0.99, f"last-token logits drifted from transformers (cosine {cos:.4f})"
+
+
+class TestQwen3_5MoeForCausalLM(LLMTest.TestLLM):
+    RBLN_CLASS = RBLNQwen3_5MoeForCausalLM
+    # Two layers (linear_attention, full_attention), each with 4 routed experts (top-2) and a shared expert.
+    HF_MODEL_ID = "trl-internal-testing/tiny-Qwen3_5MoeForConditionalGeneration-3.6"
+    RBLN_AUTO_CLASS = None
+    RBLN_CLASS_KWARGS = {"rbln_config": {"num_devices": 1, "max_seq_len": 8192, "kvcache_partition_len": 4096}}
+    HF_CONFIG_KWARGS = {}
+
+    @classmethod
+    def setUpClass(cls):
+        config = AutoConfig.from_pretrained(cls.HF_MODEL_ID).get_text_config()
+        # custom_moe_glu tiles the expert weights 64x64 (the tiny checkpoint is 16 wide with 32-wide experts), and
+        # RBLN-CR13 compiles it only with 8 or more experts (the checkpoint has 4).
+        config.hidden_size = 64
+        config.moe_intermediate_size = 64
+        config.shared_expert_intermediate_size = 64
+        config.num_experts = 8
+        cls.HF_CONFIG_KWARGS.update({"config": config, "ignore_mismatched_sizes": True})
+        return super().setUpClass()
 
 
 class TestOPTForCausalLM(LLMTest.TestLLM):
@@ -1275,6 +1301,50 @@ class TestQwen3_5ForConditionalGeneration_OutputHiddenStates(TestQwen3_5ForCondi
         self._test_output_hidden_states_generation()
 
 
+class TestQwen3_5MoeForConditionalGeneration(LLMTest.TestLLM):
+    RBLN_AUTO_CLASS = RBLNAutoModelForImageTextToText
+    RBLN_CLASS = RBLNQwen3_5MoeForConditionalGeneration
+    HF_MODEL_ID = "trl-internal-testing/tiny-Qwen3_5MoeForConditionalGeneration-3.6"
+    PROMPT = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>Describe this image.<|im_end|>\n<|im_start|>assistant\n"
+    RBLN_CLASS_KWARGS = {
+        "rbln_config": {
+            "visual": {"max_seq_len": 512},
+            "num_devices": 1,
+            "kvcache_partition_len": 4096,
+            "max_seq_len": 8192,
+        }
+    }
+    IS_MULTIMODAL = True
+    HF_CONFIG_KWARGS = {}
+    HF_CONFIG_KWARGS_PREPROCESSOR = {"min_pixels": 64 * 16 * 16, "max_pixels": 64 * 16 * 16}
+
+    @classmethod
+    def setUpClass(cls):
+        config = AutoConfig.from_pretrained(cls.HF_MODEL_ID)
+        text_config = json.loads(config.text_config.to_json_string())
+        vision_config = json.loads(config.vision_config.to_json_string())
+        # custom_moe_glu tiles the expert weights 64x64 (the tiny checkpoint is 16 wide with 32-wide experts), and
+        # RBLN-CR13 compiles it only with 8 or more experts (the checkpoint has 4).
+        text_config["hidden_size"] = 64
+        text_config["moe_intermediate_size"] = 64
+        text_config["shared_expert_intermediate_size"] = 64
+        text_config["num_experts"] = 8
+        vision_config["out_hidden_size"] = 64
+        cls.HF_CONFIG_KWARGS.update(
+            {"text_config": text_config, "vision_config": vision_config, "ignore_mismatched_sizes": True}
+        )
+        return super().setUpClass()
+
+    def get_inputs(self):
+        tokenizer = self.get_tokenizer()
+        img_path = f"{os.path.dirname(__file__)}/../assets/rbln_logo_light.png"
+        image = Image.open(img_path)
+        inputs = tokenizer(images=[image], text=[self.PROMPT], return_tensors="pt", padding=True)
+        inputs["max_new_tokens"] = 20
+        inputs["do_sample"] = False
+        return inputs
+
+
 class TestQwen3ASRForConditionalGeneration(LLMTest.TestLLM):
     RBLN_AUTO_CLASS = RBLNAutoModelForMultimodalLM
     RBLN_CLASS = RBLNQwen3ASRForConditionalGeneration
@@ -1587,6 +1657,31 @@ class TestMoeHostMemory(unittest.TestCase):
             state_dict = {k: v.clone() for k, v in src.state_dict().items()}
             del src
             self._check(RBLNGemma4ForCausalLM, RBLNGemma4ForCausalLMConfig, tmp, state_dict)
+
+    def test_qwen3_5_moe_fused_checkpoint(self):
+        # Qwen3.5-MoE checkpoints store the experts fused, like Gemma4, and the hybrid wrapper also rebuilds the
+        # GatedDeltaNet projections; neither may keep a second copy of the weights alive.
+        base = {k: v for k, v in self.BASE.items() if k != "intermediate_size"}
+        config = Qwen3_5MoeTextConfig(
+            **base,
+            head_dim=64,
+            num_hidden_layers=4,
+            layer_types=["linear_attention", "linear_attention", "linear_attention", "full_attention"],
+            linear_num_key_heads=4,
+            linear_num_value_heads=8,
+            linear_key_head_dim=64,
+            linear_value_head_dim=64,
+            num_experts=64,
+            num_experts_per_tok=4,
+            moe_intermediate_size=512,
+            shared_expert_intermediate_size=512,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Qwen3_5MoeForCausalLM(config).to(torch.bfloat16).eval()
+            src.save_pretrained(tmp)
+            state_dict = {k: v.clone() for k, v in src.state_dict().items()}
+            del src
+            self._check(RBLNQwen3_5MoeForCausalLM, RBLNQwen3_5MoeForCausalLMConfig, tmp, state_dict)
 
     def test_qwen3_vl_moe_hub_layout(self):
         # Hub checkpoints store the experts transposed; transformers transposes them into new memory at load.
