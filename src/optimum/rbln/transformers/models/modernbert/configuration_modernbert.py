@@ -12,7 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ...configuration_generic import RBLNModelForMaskedLMConfig
+from ...configuration_generic import RBLNModelForMaskedLMConfig, RBLNTransformerEncoderForFeatureExtractionConfig
+
+
+class RBLNModernBertModelConfig(RBLNTransformerEncoderForFeatureExtractionConfig):
+    """
+    Configuration class for RBLNModernBertModel.
+
+    This configuration class stores the configuration parameters specific to
+    RBLN-optimized ModernBERT encoders that return the last hidden state, for feature
+    extraction and for task heads that run outside the encoder.
+    """
 
 
 class RBLNModernBertForMaskedLMConfig(RBLNModelForMaskedLMConfig):
@@ -26,4 +36,5 @@ class RBLNModernBertForMaskedLMConfig(RBLNModelForMaskedLMConfig):
 
 __all__ = [
     "RBLNModernBertForMaskedLMConfig",
+    "RBLNModernBertModelConfig",
 ]
