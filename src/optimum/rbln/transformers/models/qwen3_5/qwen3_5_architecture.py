@@ -30,6 +30,7 @@ from ..decoderonly.decoderonly_architecture import (
     rotate_half,
     slice_and_unsqueeze_cos_sin,
 )
+from ..decoderonly.lora_architecture import LoRALinear
 
 
 def apply_rotary_pos_emb_vision(q, k, cos, sin):
@@ -260,6 +261,50 @@ def rbln_recurrent_gated_delta_rule_step(query, key, value, g, beta, initial_sta
     return core, new_state
 
 
+class Qwen3_5FusedLoRALinear(nn.Module):
+    """Projections that read the same input, run as one linear plus one LoRA term; returns one output per projection.
+
+    Each `LoRALinear` adds an adapter gather and two batched matmuls to the graph. A full Qwen3.5-27B with one per
+    projection compiles, but stops RBLN-CR13 on its first run once the graph holds more than about 300 of them
+    (rebel-compiler 0.12.1.dev163). Stacking the projections' LoRA A along the rank and their B block-diagonally
+    computes the same sums with one LoRA term per input.
+    """
+
+    def __init__(self, projections: list[LoRALinear]):
+        super().__init__()
+        self.out_features = [p.out_features for p in projections]
+        self.register_buffer("weight", torch.cat([p.weight for p in projections]))
+        if any(p.bias is not None for p in projections):
+            biases = [p.bias if p.bias is not None else p.weight.new_zeros(p.out_features) for p in projections]
+            self.register_buffer("bias", torch.cat(biases))
+        else:
+            self.bias = None
+
+        targeted = [i for i, p in enumerate(projections) if p._should_apply_lora()]
+        self.has_lora = bool(targeted)
+        if not self.has_lora:
+            return
+        offsets = [sum(self.out_features[:i]) for i in range(len(projections))]
+        lora_a = projections[targeted[0]].lora_a_weights
+        num_adapters, in_features, rank = lora_a.shape
+        fused_a = lora_a.new_zeros(num_adapters, in_features, rank * len(targeted))
+        fused_b = lora_a.new_zeros(num_adapters, rank * len(targeted), sum(self.out_features))
+        for block, i in enumerate(targeted):
+            ranks = slice(block * rank, (block + 1) * rank)
+            fused_a[:, :, ranks] = projections[i].lora_a_weights
+            fused_b[:, ranks, offsets[i] : offsets[i] + self.out_features[i]] = projections[i].lora_b_weights
+        self.register_buffer("lora_a_weights", fused_a)
+        self.register_buffer("lora_b_weights", fused_b)
+
+    def forward(self, x: torch.Tensor, lora_int_id: torch.Tensor | None = None) -> tuple[torch.Tensor, ...]:
+        output = F.linear(x, self.weight, self.bias)
+        if self.has_lora and lora_int_id is not None:
+            lora_a = self.lora_a_weights[lora_int_id]
+            lora_b = self.lora_b_weights[lora_int_id]
+            output = output + torch.bmm(torch.bmm(x, lora_a), lora_b)
+        return output.split(self.out_features, dim=-1)
+
+
 class Qwen3_5GatedDeltaNet(nn.Module):
     """GatedDeltaNet token mixer for RBLN (conv_state + recurrent_state are on-device static caches).
 
@@ -293,6 +338,30 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.num_v_heads = linear_attn.num_v_heads
         self.conv_dim = linear_attn.conv_dim
         self.conv_kernel_size = linear_attn.conv_kernel_size
+        self.lora_config = rbln_config.lora_config
+
+        self.prefill_chunk_size = rbln_config.prefill_chunk_size
+        self.chunk_size = rbln_config.gdn_chunk_size
+
+        if self.lora_config:
+
+            def lora_linear(name: str) -> LoRALinear:
+                return LoRALinear(
+                    getattr(linear_attn, name),
+                    self.lora_config,
+                    projection_name=name,
+                    layer_idx=layer_idx,
+                    module_path=f"model.layers.{layer_idx}.linear_attn.{name}",
+                )
+
+            # in_proj_qkv and in_proj_z read the same hidden state; one LoRA term covers both (and spans the fused
+            # in_proj_qkv, which therefore stays fused). The narrow in_proj_b and in_proj_a stay apart: fused into the
+            # same projection, the compile aborted (rebel-compiler 0.12.1.dev163).
+            self.in_proj_qkvz = Qwen3_5FusedLoRALinear([lora_linear("in_proj_qkv"), lora_linear("in_proj_z")])
+            self.in_proj_b = lora_linear("in_proj_b")
+            self.in_proj_a = lora_linear("in_proj_a")
+            self.out_proj = lora_linear("out_proj")
+            return
 
         # Pre-split the fused in_proj_qkv into separate Q/K/V projections: a depthwise conv is per-channel,
         # so the channel-axis split commutes with it.
@@ -309,9 +378,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             _lin.weight = nn.Parameter(_wi.contiguous())
             if _has_bias:
                 _lin.bias = nn.Parameter(_bi.contiguous())
-
-        self.prefill_chunk_size = rbln_config.prefill_chunk_size
-        self.chunk_size = rbln_config.gdn_chunk_size
 
     @property
     def phase(self):
@@ -330,6 +396,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         valid_mask: torch.Tensor | None = None,
         conv_state_mask: torch.Tensor | None = None,
         recurrent_state_mask: torch.Tensor | None = None,
+        lora_int_id: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, seq_len, _ = hidden_states.shape
         k_1 = self.conv_kernel_size - 1
@@ -343,14 +410,24 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             if recurrent_state_mask is not None:
                 recurrent_state = recurrent_state * recurrent_state_mask
 
-        z = self.in_proj_z(hidden_states).reshape(batch_size, seq_len, -1, self.head_v_dim)
-        b = self.in_proj_b(hidden_states)
-        a = self.in_proj_a(hidden_states)
-
         kd, vd = self.key_dim, self.value_dim
-        q_in = self.in_proj_q(hidden_states)
-        k_in = self.in_proj_k(hidden_states)
-        v_in = self.in_proj_v(hidden_states)
+        if self.lora_config:
+            # The gated norm reads z in fp32 anyway. Casting here keeps bf16 compiles correct: without it, a LoRA on
+            # in_proj_z made the whole model diverge from transformers, even with the base adapter
+            # (rebel-compiler 0.12.1.dev163).
+            qkv, z = self.in_proj_qkvz(hidden_states, lora_int_id)
+            q_in, k_in, v_in = qkv.split([kd, kd, vd], dim=-1)
+            z = z.float()
+            b = self.in_proj_b(hidden_states, lora_int_id)
+            a = self.in_proj_a(hidden_states, lora_int_id)
+        else:
+            z = self.in_proj_z(hidden_states)
+            b = self.in_proj_b(hidden_states)
+            a = self.in_proj_a(hidden_states)
+            q_in = self.in_proj_q(hidden_states)
+            k_in = self.in_proj_k(hidden_states)
+            v_in = self.in_proj_v(hidden_states)
+        z = z.reshape(batch_size, seq_len, -1, self.head_v_dim)
 
         q_cf = torch.cat([conv_state[:, :, :kd].transpose(1, 2), q_in.transpose(1, 2)], dim=-1)
         k_cf = torch.cat([conv_state[:, :, kd : 2 * kd].transpose(1, 2), k_in.transpose(1, 2)], dim=-1)
@@ -421,20 +498,33 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         z = z.reshape(-1, self.head_v_dim)
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
-        output = self.out_proj(core_attn_out)
+        output = self.out_proj(core_attn_out, lora_int_id) if self.lora_config else self.out_proj(core_attn_out)
         return output, new_conv_state, new_recurrent_state.contiguous()
 
 
 class Qwen3_5LinearDecoderLayer(nn.Module):
     """A ``linear_attention`` decoder layer: GatedDeltaNet token mixer + MLP (on-device static states)."""
 
-    def __init__(self, layer: nn.Module, linear_attn: Qwen3_5GatedDeltaNet):
+    def __init__(self, layer: nn.Module, linear_attn: Qwen3_5GatedDeltaNet, lora_config=None):
         super().__init__()
         self.linear_attn = linear_attn
         self.input_layernorm = layer.input_layernorm
         self.post_attention_layernorm = layer.post_attention_layernorm
         self.mlp = layer.mlp
         self._phase = "prefill"
+        self.mlp_lora = bool(lora_config) and all(
+            isinstance(getattr(self.mlp, name, None), nn.Linear) for name in ("gate_proj", "up_proj", "down_proj")
+        )
+        if self.mlp_lora:
+            layer_idx = linear_attn.layer_idx
+            # gate_proj and up_proj read the same input: one LoRA term (Qwen3_5FusedLoRALinear).
+            self.mlp_gate_up = Qwen3_5FusedLoRALinear(
+                [
+                    LoRALinear(getattr(self.mlp, name), lora_config, name, layer_idx)
+                    for name in ("gate_proj", "up_proj")
+                ]
+            )
+            self.mlp_down = LoRALinear(self.mlp.down_proj, lora_config, "down_proj", layer_idx)
 
     @property
     def phase(self):
@@ -454,6 +544,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         valid_mask: torch.Tensor | None = None,
         conv_state_mask: torch.Tensor | None = None,
         recurrent_state_mask: torch.Tensor | None = None,
+        lora_int_id: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -465,12 +556,17 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             valid_mask=valid_mask,
             conv_state_mask=conv_state_mask,
             recurrent_state_mask=recurrent_state_mask,
+            lora_int_id=lora_int_id,
         )
         hidden_states = residual + hidden_states
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        if self.mlp_lora:
+            gate, up = self.mlp_gate_up(hidden_states, lora_int_id)
+            hidden_states = self.mlp_down(self.mlp.act_fn(gate) * up, lora_int_id)
+        else:
+            hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states, new_conv_state, new_recurrent_state
 
@@ -483,6 +579,21 @@ class Qwen3_5Attention(DecoderOnlyAttention):
         self.q_norm = self_attn.q_norm
         self.k_norm = self_attn.k_norm
 
+        partial_rotary_factor = getattr(self.config, "partial_rotary_factor", 1.0)
+        self.rotary_ndims = int(self.head_dim * partial_rotary_factor)
+
+        if self.lora_config:
+            # q, k and v read the same input: one LoRA term (Qwen3_5FusedLoRALinear). q_proj interleaves the query
+            # and the output gate per head, and so do its LoRA rows, so it stays fused and is split in forward.
+            self.qkv_proj = Qwen3_5FusedLoRALinear(
+                [
+                    LoRALinear(getattr(self_attn, name), self.lora_config, name, self.layer_idx)
+                    for name in ("q_proj", "k_proj", "v_proj")
+                ]
+            )
+            self.o_proj = LoRALinear(self_attn.o_proj, self.lora_config, "o_proj", self.layer_idx)
+            return
+
         hidden = self_attn.q_proj.weight.shape[1]
         has_bias = self_attn.q_proj.bias is not None
         w = self_attn.q_proj.weight.data.view(self.num_heads, 2, self.head_dim, hidden)
@@ -494,9 +605,6 @@ class Qwen3_5Attention(DecoderOnlyAttention):
             bsplit = self_attn.q_proj.bias.data.view(self.num_heads, 2, self.head_dim)
             self.q_proj.bias = nn.Parameter(bsplit[:, 0].reshape(-1).contiguous())
             self.gate_proj.bias = nn.Parameter(bsplit[:, 1].reshape(-1).contiguous())
-
-        partial_rotary_factor = getattr(self.config, "partial_rotary_factor", 1.0)
-        self.rotary_ndims = int(self.head_dim * partial_rotary_factor)
 
     def apply_rotary_pos_embed(self, query_states, key_states, cos, sin):
         return apply_rotary_pos_emb_partial(query_states, key_states, cos, sin, ndim=self.rotary_ndims)
@@ -514,19 +622,23 @@ class Qwen3_5Attention(DecoderOnlyAttention):
     ):
         batch_size, query_length, _ = hidden_states.size()
 
-        gate = self.gate_proj(hidden_states)
-        query_states = (
-            self.q_proj(hidden_states).view(batch_size, query_length, self.num_heads, self.head_dim).transpose(1, 2)
-        )
-        key_states = (
-            self.k_proj(hidden_states)
-            .view(batch_size, query_length, self.num_key_value_heads, self.head_dim)
-            .transpose(1, 2)
-        )
-        value_states = (
-            self.v_proj(hidden_states)
-            .view(batch_size, query_length, self.num_key_value_heads, self.head_dim)
-            .transpose(1, 2)
+        if self.lora_config:
+            query_gate, key_states, value_states = self.qkv_proj(hidden_states, lora_int_id)
+            query_gate = query_gate.view(batch_size, query_length, self.num_heads, 2, self.head_dim)
+            query_states = query_gate[..., 0, :].transpose(1, 2)
+            gate = query_gate[..., 1, :].reshape(batch_size, query_length, -1)
+        else:
+            gate = self.gate_proj(hidden_states)
+            query_states = (
+                self.q_proj(hidden_states)
+                .view(batch_size, query_length, self.num_heads, self.head_dim)
+                .transpose(1, 2)
+            )
+            key_states = self.k_proj(hidden_states)
+            value_states = self.v_proj(hidden_states)
+        key_states = key_states.view(batch_size, query_length, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(batch_size, query_length, self.num_key_value_heads, self.head_dim).transpose(
+            1, 2
         )
 
         query_states = self.q_norm(query_states)
@@ -556,7 +668,7 @@ class Qwen3_5Attention(DecoderOnlyAttention):
         )
         attn_output = attn_output.reshape(batch_size, query_length, self.num_heads * self.head_dim)
         attn_output = attn_output * torch.sigmoid(gate)
-        attn_output = self.o_proj(attn_output)
+        attn_output = self.o_proj(attn_output, lora_int_id) if self.lora_config else self.o_proj(attn_output)
         return attn_output
 
 
@@ -636,6 +748,7 @@ class Qwen3_5Model(DecoderOnlyModel):
                     valid_mask=valid_mask,
                     conv_state_mask=conv_state_mask,
                     recurrent_state_mask=recurrent_state_mask,
+                    lora_int_id=lora_int_id,
                 )
                 _axis0 = torch.tensor(0, dtype=torch.int16)
                 new_states.append(
@@ -663,6 +776,16 @@ class Qwen3_5Model(DecoderOnlyModel):
 
 
 class Qwen3_5ForCausalLM(DecoderOnlyForCausalLM):
+    def __init__(self, causal_lm: PreTrainedModel, model: nn.Module):
+        super().__init__(causal_lm, model)
+        lora_config = model.rbln_config.lora_config
+        # Some adapters train the LM head too (e.g. a decision head over a few verbalizer tokens).
+        self.lm_head_lora = bool(lora_config) and any(
+            "lm_head" in (adapter.target_modules or []) for adapter in lora_config.adapters
+        )
+        if self.lm_head_lora:
+            self.lm_head = LoRALinear(self.lm_head, lora_config, "lm_head", module_path="lm_head")
+
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -707,7 +830,7 @@ class Qwen3_5ForCausalLM(DecoderOnlyForCausalLM):
         if "prefill" in self.phase and query_position is not None and self.model.rbln_config.logits_to_keep == 1:
             hidden_states = hidden_states[:, query_position.to(torch.int).unsqueeze(0)]
 
-        logits = self.lm_head(hidden_states)
+        logits = self.lm_head(hidden_states, lora_int_id) if self.lm_head_lora else self.lm_head(hidden_states)
         return logits, new_states, all_hidden_states
 
 
@@ -739,7 +862,9 @@ class Qwen3_5_CausalLMWrapper(DecoderOnlyWrapper):
         for layer_idx, layer in enumerate(self.get_decoder_layers(model)):
             if layer_types[layer_idx] == "linear_attention":
                 rbln_deltanet = Qwen3_5GatedDeltaNet(layer.linear_attn, self.rbln_config, layer_idx)
-                new_layers.append(Qwen3_5LinearDecoderLayer(layer, rbln_deltanet))
+                new_layers.append(
+                    Qwen3_5LinearDecoderLayer(layer, rbln_deltanet, lora_config=self.rbln_config.lora_config)
+                )
             else:
                 new_self_attn = self.get_rbln_attn_class()(layer.self_attn, self.rbln_config, is_sliding=False)
                 new_layers.append(
