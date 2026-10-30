@@ -703,7 +703,8 @@ class Qwen3_5ForCausalLM(DecoderOnlyForCausalLM):
             output_hidden_states=output_hidden_states,
         )
 
-        if "prefill" in self.phase and query_position is not None:
+        # query_position also reaches here for the GatedDeltaNet when every position is kept; slice only for 1.
+        if "prefill" in self.phase and query_position is not None and self.model.rbln_config.logits_to_keep == 1:
             hidden_states = hidden_states[:, query_position.to(torch.int).unsqueeze(0)]
 
         logits = self.lm_head(hidden_states)
@@ -772,6 +773,14 @@ class Qwen3_5_CausalLMWrapper(DecoderOnlyWrapper):
         recurrent_state_mask = args.pop() if has_linear else None
         conv_state_mask = args.pop() if has_linear else None
 
+        # The base parser reads query_position only for logits_to_keep == 1 or sliding windows, but the GatedDeltaNet
+        # prefill always takes it (see `get_input_info`). Pop it here in the other cases; it follows the inputs, the
+        # cache positions and the block tables.
+        gdn_query_position = None
+        base_reads_query_position = self.rbln_config.logits_to_keep == 1 or self.rbln_config.use_local_attention
+        if has_linear and "prefill" in self.phase and not base_reads_query_position:
+            gdn_query_position = args.pop(2 + int(self.rbln_config.use_global_attention))
+
         (
             input_ids,
             inputs_embeds,
@@ -785,6 +794,8 @@ class Qwen3_5_CausalLMWrapper(DecoderOnlyWrapper):
             pairs,  # base groups the trailing flat per-layer states into (a, b) pairs
             rotary_emb,
         ) = super().prepare_forward_args(*args)
+        if gdn_query_position is not None:
+            query_position = gdn_query_position
 
         # full_attention -> past_key_values (key, value); linear_attention -> past_states (conv, recurrent).
         past_key_values, past_states = self._split_layer_states(pairs)
@@ -884,7 +895,10 @@ class Qwen3_5_LanguageModelWrapper(Qwen3_5_CausalLMWrapper):
         global_block_tables = args.pop(0)
         local_block_tables = None
         position_embeds = args.pop(0)
-        query_position = args.pop(0) if self.phase == "prefill" and self.rbln_config.logits_to_keep > 0 else None
+        # The GatedDeltaNet prefill takes query_position also when every position is kept (see `get_input_info`).
+        query_position = (
+            args.pop(0) if self.phase == "prefill" and (has_linear or self.rbln_config.logits_to_keep > 0) else None
+        )
         position_ids = None
         attention_mask = args.pop(0) if self.rbln_config.use_attention_mask else None
         lora_int_id = args.pop(0) if self.rbln_config.lora_config else None

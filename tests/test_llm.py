@@ -21,8 +21,10 @@ from transformers import (
     Qwen2MoeConfig,
     Qwen2MoeForCausalLM,
     Qwen3_5ForCausalLM,
+    Qwen3_5Model,
     Qwen3_5MoeForCausalLM,
     Qwen3_5MoeTextConfig,
+    Qwen3_5TextModel,
     Qwen3MoeConfig,
     Qwen3MoeForCausalLM,
     Qwen3VLMoeConfig,
@@ -75,9 +77,11 @@ from optimum.rbln import (
     RBLNQwen2VLForConditionalGeneration,
     RBLNQwen3_5ForCausalLM,
     RBLNQwen3_5ForConditionalGeneration,
+    RBLNQwen3_5Model,
     RBLNQwen3_5MoeForCausalLM,
     RBLNQwen3_5MoeForCausalLMConfig,
     RBLNQwen3_5MoeForConditionalGeneration,
+    RBLNQwen3_5TextModel,
     RBLNQwen3ASRForConditionalGeneration,
     RBLNQwen3ForCausalLM,
     RBLNQwen3Model,
@@ -391,6 +395,42 @@ class TestQwen3_5MoeForCausalLM(LLMTest.TestLLM):
         config.num_experts = 8
         cls.HF_CONFIG_KWARGS.update({"config": config, "ignore_mismatched_sizes": True})
         return super().setUpClass()
+
+
+class TestQwen3_5TextModel(LLMTest.TestLLMWithoutLMHead):
+    RBLN_CLASS = RBLNQwen3_5TextModel
+    HF_MODEL_ID = "Qwen/Qwen3.5-0.8B"
+    # AutoModel resolves a qwen3_5 config to the vision-language Qwen3_5Model (TestQwen3_5Model).
+    RBLN_AUTO_CLASS = None
+    RBLN_CLASS_KWARGS = {"rbln_config": {"num_devices": 1, "max_seq_len": 8192, "kvcache_partition_len": 4096}}
+    HF_CONFIG_KWARGS = {}
+
+    @classmethod
+    def setUpClass(cls):
+        config = AutoConfig.from_pretrained(cls.HF_MODEL_ID).get_text_config()
+        config.num_hidden_layers = 4
+        config.layer_types = ["linear_attention", "linear_attention", "linear_attention", "full_attention"]
+        cls.HF_CONFIG_KWARGS.update({"config": config, "ignore_mismatched_sizes": True})
+        return super().setUpClass()
+
+    def test_last_hidden_state_matches_hf(self):
+        # Every position is kept (logits_to_keep == 0), so the GatedDeltaNet prefill has to carry its conv state
+        # across windows without the logits row it used to take query_position from.
+        if os.environ.get("REUSE_ARTIFACTS_PATH") is not None:
+            return
+        chunk_size = self.model.rbln_config.prefill_chunk_size
+        hf_model = Qwen3_5TextModel.from_pretrained(self.HF_MODEL_ID, **self.HF_CONFIG_KWARGS, dtype=torch.float32)
+        text = "The quick brown fox jumps over the lazy dog, and the dog chases the fox back home. " * 80
+        ids = self.get_tokenizer()(text, return_tensors="pt", add_special_tokens=False)["input_ids"]
+        for length in (chunk_size - 1, 2 * chunk_size + chunk_size // 2):
+            with self.subTest(length=length):
+                input_ids = ids[:, :length]
+                with torch.no_grad():
+                    expected = hf_model(input_ids=input_ids).last_hidden_state.float()
+                output = self.model(input_ids=input_ids).last_hidden_state.float()
+                assert output.shape == expected.shape
+                cos = torch.nn.functional.cosine_similarity(output, expected, dim=-1)
+                assert cos.min() > 0.99, f"hidden states drifted from transformers (min cosine {cos.min():.4f})"
 
 
 class TestOPTForCausalLM(LLMTest.TestLLM):
@@ -1259,6 +1299,45 @@ class TestQwen3_5ForConditionalGeneration(LLMTest.TestLLM):
         inputs["max_new_tokens"] = 20
         inputs["do_sample"] = False
         return inputs
+
+
+class TestQwen3_5Model(TestQwen3_5ForConditionalGeneration):
+    RBLN_AUTO_CLASS = RBLNAutoModel
+    RBLN_CLASS = RBLNQwen3_5Model
+    RBLN_CLASS_KWARGS = {
+        "rbln_config": {
+            "visual": {"max_seq_len": 512},
+            "num_devices": 1,
+            "kvcache_partition_len": 4096,
+            "max_seq_len": 8192,
+            "use_inputs_embeds": True,
+        }
+    }
+    HF_CONFIG_KWARGS = {}
+
+    def get_inputs(self):
+        tokenizer = self.get_tokenizer()
+        image = Image.open(f"{os.path.dirname(__file__)}/../assets/rbln_logo_light.png")
+        return tokenizer(images=[image], text=[self.PROMPT], return_tensors="pt", padding=True)
+
+    def test_hidden_states_match_hf(self):
+        # The bare model keeps every position (logits_to_keep == 0); the GatedDeltaNet prefill still needs the
+        # window's last valid position to carry its conv state, so the prompt spans more than two windows.
+        if os.environ.get("REUSE_ARTIFACTS_PATH") is not None:
+            return
+        chunk_size = self.model.rbln_config.prefill_chunk_size
+        filler = "The quick brown fox jumps over the lazy dog, and the dog chases the fox back home. "
+        prompt = self.PROMPT.replace("Describe this image.", "Describe this image. " + filler * (chunk_size // 6))
+        image = Image.open(f"{os.path.dirname(__file__)}/../assets/rbln_logo_light.png")
+        inputs = self.get_tokenizer()(images=[image], text=[prompt], return_tensors="pt", padding=True)
+        assert inputs["input_ids"].shape[1] > 2 * chunk_size
+        hf_model = Qwen3_5Model.from_pretrained(self.HF_MODEL_ID, **self.HF_CONFIG_KWARGS, dtype=torch.float32)
+        with torch.no_grad():
+            expected = hf_model(**inputs).last_hidden_state.float()
+        output = self.model(**inputs).logits.float()
+        assert output.shape == expected.shape
+        cos = torch.nn.functional.cosine_similarity(output, expected, dim=-1)
+        assert cos.min() > 0.99, f"hidden states drifted from transformers (min cosine {cos.min():.4f})"
 
 
 class TestQwen3_5ForConditionalGeneration_OutputHiddenStates(TestQwen3_5ForConditionalGeneration):
