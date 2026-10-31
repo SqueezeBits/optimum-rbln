@@ -825,12 +825,21 @@ class Qwen3_5ForCausalLM(DecoderOnlyForCausalLM):
             batch_idx=batch_idx,
             output_hidden_states=output_hidden_states,
         )
+        final_hidden = hidden_states
 
         # query_position also reaches here for the GatedDeltaNet when every position is kept; slice only for 1.
         if "prefill" in self.phase and query_position is not None and self.model.rbln_config.logits_to_keep == 1:
             hidden_states = hidden_states[:, query_position.to(torch.int).unsqueeze(0)]
 
         logits = self.lm_head(hidden_states, lora_int_id) if self.lm_head_lora else self.lm_head(hidden_states)
+        return self._build_outputs(logits, new_states, all_hidden_states, final_hidden)
+
+    def _build_outputs(self, logits, new_states, all_hidden_states, final_hidden):
+        """Return `(logits, new_states, all_hidden_states, *extra)`; a subclass with extra graph outputs overrides this.
+
+        `final_hidden` is the final-norm hidden of every row, taken before the prefill query_position slice. The
+        wrapper puts the extra outputs after the states and the per-layer hidden states.
+        """
         return logits, new_states, all_hidden_states
 
 
@@ -856,6 +865,9 @@ class Qwen3_5_CausalLMWrapper(DecoderOnlyWrapper):
     def get_rbln_causal_lm_class(self):
         return Qwen3_5ForCausalLM
 
+    def get_rbln_linear_layer_class(self):
+        return Qwen3_5LinearDecoderLayer
+
     def convert_to_rbln_class(self, model, max_seq_len: int, use_rotary_emb: bool):
         layer_types = self.config.layer_types
         new_layers = []
@@ -863,7 +875,7 @@ class Qwen3_5_CausalLMWrapper(DecoderOnlyWrapper):
             if layer_types[layer_idx] == "linear_attention":
                 rbln_deltanet = Qwen3_5GatedDeltaNet(layer.linear_attn, self.rbln_config, layer_idx)
                 new_layers.append(
-                    Qwen3_5LinearDecoderLayer(layer, rbln_deltanet, lora_config=self.rbln_config.lora_config)
+                    self.get_rbln_linear_layer_class()(layer, rbln_deltanet, lora_config=self.rbln_config.lora_config)
                 )
             else:
                 new_self_attn = self.get_rbln_attn_class()(layer.self_attn, self.rbln_config, is_sliding=False)
@@ -963,7 +975,7 @@ class Qwen3_5_CausalLMWrapper(DecoderOnlyWrapper):
             batch_idx,
         ) = self.prepare_forward_args(*args)
 
-        logits, new_states, all_hidden_states = self.model(
+        logits, new_states, all_hidden_states, *extra = self.model(
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
@@ -984,10 +996,11 @@ class Qwen3_5_CausalLMWrapper(DecoderOnlyWrapper):
         )
 
         # Linear-attention state updates are returned so the runtime can persist them on the host; the
-        # per-layer hidden states (n_layers + 1) trail last when output_hidden_states is requested.
+        # per-layer hidden states (n_layers + 1) trail when output_hidden_states is requested, then the extra outputs
+        # of a causal LM subclass (`Qwen3_5ForCausalLM._build_outputs`).
         if self.rbln_config.output_hidden_states:
-            return (logits, *new_states, *all_hidden_states)
-        return (logits, *new_states)
+            return (logits, *new_states, *all_hidden_states, *extra)
+        return (logits, *new_states, *extra)
 
 
 class Qwen3_5_LanguageModelWrapper(Qwen3_5_CausalLMWrapper):

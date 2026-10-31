@@ -54,6 +54,9 @@ class RBLNQwen3_5ForCausalLMConfig(RBLNDecoderOnlyModelForCausalLMConfig):
     ```
     """
 
+    # True in a subclass whose `decoder_batch_<b>` graphs use only rows [:b] of the linear-attention state.
+    _allows_decoder_batch_bucketing = False
+
     def __init__(
         self,
         gdn_chunk_size: int | None = None,
@@ -72,7 +75,8 @@ class RBLNQwen3_5ForCausalLMConfig(RBLNDecoderOnlyModelForCausalLMConfig):
         super().__init__(**kwargs)
         self.gdn_chunk_size = MAX_GDN_CHUNK_SIZE if gdn_chunk_size is None else gdn_chunk_size
         self.linear_attention_layers = linear_attention_layers or []
-        _reject_decoder_batch_bucketing(self)
+        if not self._allows_decoder_batch_bucketing:
+            _reject_decoder_batch_bucketing(self)
 
 
 class RBLNQwen3_5TextModelConfig(RBLNDecoderOnlyModelConfig):

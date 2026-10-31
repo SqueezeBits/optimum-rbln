@@ -5,6 +5,7 @@ import os
 import tempfile
 import unittest
 import warnings
+from pathlib import Path
 
 import pytest
 import torch
@@ -40,6 +41,7 @@ from optimum.rbln import (
     RBLNBartForConditionalGeneration,
     RBLNBlip2ForConditionalGeneration,
     RBLNExaoneForCausalLM,
+    RBLNFishOmniForCausalLM,
     RBLNGemma3ForCausalLM,
     RBLNGemma3ForConditionalGeneration,
     RBLNGemma4ForCausalLM,
@@ -96,7 +98,7 @@ from optimum.rbln import (
     RBLNT5ForConditionalGeneration,
 )
 
-from .test_base import BaseTest, DisallowedTestBase, TestLevel
+from .test_base import BaseTest, DisallowedTestBase, TestLevel, make_tiny_fish_omni_checkpoint
 
 
 RANDOM_ATTN_MASK = torch.randint(low=0, high=2, size=(1, 512), generator=torch.manual_seed(42), dtype=torch.int64)
@@ -500,6 +502,26 @@ class TestQwen3_5MoeForCausalLM(LLMTest.TestLLM):
         config.num_experts = 8
         cls.HF_CONFIG_KWARGS.update({"config": config, "ignore_mismatched_sizes": True})
         return super().setUpClass()
+
+
+class TestFishOmniForCausalLM(LLMTest.TestLLM):
+    RBLN_CLASS = RBLNFishOmniForCausalLM
+    # One layer of each kind (linear_attention, full_attention), 8 block-FP8 experts (top-2) and a shared expert.
+    RBLN_AUTO_CLASS = None
+    RBLN_CLASS_KWARGS = {"rbln_config": {"num_devices": 1, "max_seq_len": 8192, "kvcache_partition_len": 4096}}
+    HF_CONFIG_KWARGS = {"num_hidden_layers": 2, "layer_types": ["linear_attention", "full_attention"]}
+
+    @classmethod
+    def setUpClass(cls):
+        cls._ckpt = tempfile.TemporaryDirectory()
+        make_tiny_fish_omni_checkpoint(Path(cls._ckpt.name))
+        cls.HF_MODEL_ID = cls._ckpt.name
+        return super().setUpClass()
+
+    @classmethod
+    def tearDownClass(cls):
+        super().tearDownClass()
+        cls._ckpt.cleanup()
 
 
 class TestQwen3_5TextModel(LLMTest.TestLLMWithoutLMHead):

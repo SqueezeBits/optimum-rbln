@@ -1,20 +1,28 @@
 import gc
 import inspect
+import json
 import os
 import random
+import re
 import shutil
 import tempfile
 import unittest
 from collections.abc import Iterable
 from contextlib import nullcontext as does_not_raise
 from enum import Enum
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import torch
 import transformers
 from diffusers import DiffusionPipeline
 from huggingface_hub import HfApi
-from transformers import AutoConfig
+from safetensors.torch import save_file
+from tokenizers import Tokenizer, decoders, models
+from transformers import AutoConfig, PreTrainedTokenizerFast
+from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig
+from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeForCausalLM
 
 from optimum.rbln import __version__
 from optimum.rbln.configuration_utils import ContextRblnConfig
@@ -482,3 +490,127 @@ class DisallowedTestBase:
         @classmethod
         def get_rbln_local_dir(cls):
             return os.path.basename(cls.HF_MODEL_ID) + "-local"
+
+
+# Tiny FishOmni checkpoint, shared by the FishOmni unit tests (tests/unit/cpu) and TestFishOmniForCausalLM.
+FP8_BLOCK = 128
+TINY_TEXT = {
+    "model_type": "fish_omni_text",
+    "vocab_size": 128,
+    "hidden_size": 256,
+    "num_hidden_layers": 2,
+    "layer_types": ["linear_attention", "full_attention"],
+    "mlp_layer_types": ["moe", "moe"],
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 64,
+    "linear_conv_kernel_dim": 4,
+    "linear_key_head_dim": 32,
+    "linear_value_head_dim": 32,
+    "linear_num_key_heads": 2,
+    "linear_num_value_heads": 4,
+    "num_experts": 8,
+    "num_experts_per_tok": 2,
+    "moe_intermediate_size": 128,
+    "shared_expert_intermediate_size": 128,
+    "max_position_embeddings": 1024,
+    "rms_norm_eps": 1e-6,
+    "hidden_act": "silu",
+    "layernorm_zero_centered_gamma": True,
+    "attn_output_gate": True,
+    "use_qk_norm": True,
+    "shared_expert_gate": True,
+    "rotary_interleaved": False,
+    "tie_word_embeddings": False,
+    "rope_parameters": {"rope_type": "default", "rope_theta": 10000000.0, "partial_rotary_factor": 0.25},
+}
+
+
+def quantize_block_fp8(w: torch.Tensor):
+    rows, cols = w.shape
+    scale = torch.rand(rows // FP8_BLOCK, cols // FP8_BLOCK) * 0.5 + 0.1
+    expanded = scale.repeat_interleave(FP8_BLOCK, 0).repeat_interleave(FP8_BLOCK, 1)
+    return (w / expanded).to(torch.float8_e4m3fn), scale
+
+
+def write_tiny_tokenizer(path: Path):
+    """Write a character-level tokenizer whose ids fit TINY_TEXT's vocabulary.
+
+    The tiny `vocab_size` is 128, so the tiny checkpoint carries its own tokenizer instead of a hub one:
+    id 0 is `<|endoftext|>` (also the unknown token), ids 1-95 are printable ASCII.
+    """
+    vocab = {"<|endoftext|>": 0, **{chr(c): c - 31 for c in range(32, 127)}}
+    tokenizer = Tokenizer(models.BPE(vocab=vocab, merges=[], unk_token="<|endoftext|>"))
+    tokenizer.decoder = decoders.Fuse()
+    PreTrainedTokenizerFast(
+        tokenizer_object=tokenizer, eos_token="<|endoftext|>", model_input_names=["input_ids", "attention_mask"]
+    ).save_pretrained(path)
+
+
+def make_tiny_fish_omni_checkpoint(path: Path):
+    """Write a FishOmni-shaped checkpoint (2 layers, 8 block-FP8 experts, a tokenizer) and return the expected
+    fused experts."""
+    torch.manual_seed(0)
+    config = Qwen3_5MoeTextConfig(
+        **{
+            k: v
+            for k, v in TINY_TEXT.items()
+            if k not in ("model_type", "mlp_layer_types") and k in _TINY_TEXT_CONFIG_FIELDS
+        }
+    )
+    model = Qwen3_5MoeForCausalLM(config).float()
+    tensors, expected = {}, {}
+    for key, value in model.state_dict().items():
+        name = re.sub(r"^model\.", "model.language_model.", key)
+        if key.endswith((".experts.gate_up_proj", ".experts.down_proj")):
+            layer = key.split(".experts.")[0].replace("model.", "model.language_model.", 1)
+            gate_up = key.endswith("gate_up_proj")
+            deq = []
+            for e in range(value.shape[0]):
+                parts = value[e].chunk(2, dim=0) if gate_up else (value[e],)
+                names = ("gate", "up") if gate_up else ("down",)
+                for part, proj in zip(parts, names, strict=True):
+                    q, scale = quantize_block_fp8(part.contiguous())
+                    tensors[f"{layer}.experts.{e}.{proj}_proj.weight"] = q
+                    tensors[f"{layer}.experts.{e}.{proj}_proj.weight_scale_inv"] = scale
+                    expanded = scale.repeat_interleave(FP8_BLOCK, 0).repeat_interleave(FP8_BLOCK, 1)
+                    deq.append(q.float() * expanded)
+            if gate_up:
+                expected[key] = torch.stack([torch.cat(deq[2 * e : 2 * e + 2]) for e in range(value.shape[0])])
+            else:
+                expected[key] = torch.stack(deq)
+        else:
+            tensors[name] = value.clone()
+    tensors["audio_decoder_mtp.layers.0.eh_proj.weight"] = torch.zeros(4, 4)
+    tensors["audio_decoder_mtp_shared.layers.0.semantic_embedding.weight"] = torch.zeros(4, 4)
+    save_file(tensors, str(path / "model.safetensors"))
+    (path / "config.json").write_text(
+        json.dumps({"architectures": ["FishOmniModel"], "model_type": "fish_omni", "text_config": TINY_TEXT})
+    )
+    write_tiny_tokenizer(path)
+    return model, expected
+
+
+_TINY_TEXT_CONFIG_FIELDS = {
+    "vocab_size",
+    "hidden_size",
+    "num_hidden_layers",
+    "layer_types",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "head_dim",
+    "linear_conv_kernel_dim",
+    "linear_key_head_dim",
+    "linear_value_head_dim",
+    "linear_num_key_heads",
+    "linear_num_value_heads",
+    "num_experts",
+    "num_experts_per_tok",
+    "moe_intermediate_size",
+    "shared_expert_intermediate_size",
+    "max_position_embeddings",
+    "rms_norm_eps",
+    "hidden_act",
+    "tie_word_embeddings",
+    "rope_parameters",
+}

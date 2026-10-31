@@ -113,7 +113,7 @@ def _qwen3_5_linear_layer_indices(model_config) -> list[int]:
     return [i for i, t in enumerate(text_config.layer_types) if t == "linear_attention"]
 
 
-def _qwen3_5_setup_hybrid_runtime(model):
+def _qwen3_5_setup_hybrid_runtime(model, runtime_cls=RBLNQwen3_5RuntimeModel):
     rbln_config = model.rbln_config
     text_config = model.config.get_text_config()
     page_table_manager = RBLNPageTableManager(rbln_config)
@@ -132,7 +132,7 @@ def _qwen3_5_setup_hybrid_runtime(model):
     # Prefill runs one item at a time (batch=1) and writes its `batch_position` slot, so its state MASKS are
     # batch=1 sized (they gate the single slot the graph reads); the underlying cache is max-batch (get_input_info).
     conv_shape, recur_shape = _qwen3_5_linear_state_shapes(text_config, 1)
-    model.prefill_decoder = RBLNQwen3_5RuntimeModel(
+    model.prefill_decoder = runtime_cls(
         runtime=model.model[0],
         phase="prefill",
         batch_size=rbln_config.batch_size,
@@ -146,7 +146,7 @@ def _qwen3_5_setup_hybrid_runtime(model):
         model.decoders = {}
         for i, batch_size in enumerate(rbln_config.decoder_batch_sizes):
             conv_shape, recur_shape = _qwen3_5_linear_state_shapes(text_config, batch_size)
-            model.decoders[batch_size] = RBLNQwen3_5RuntimeModel(
+            model.decoders[batch_size] = runtime_cls(
                 runtime=model.model[i + 1],
                 phase="decode",
                 batch_size=batch_size,

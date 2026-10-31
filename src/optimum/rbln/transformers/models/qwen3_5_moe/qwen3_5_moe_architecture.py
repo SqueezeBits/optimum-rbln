@@ -53,6 +53,9 @@ class Qwen3_5MoeMLP(nn.Module):
 class Qwen3_5MoeSparseMoeBlock(nn.Module):
     """Routed experts on `custom_moe_glu` plus the shared expert scaled by `sigmoid(shared_expert_gate(x))`."""
 
+    # Routed-experts module, built as `_experts_cls(model.experts, top_k)`; a subclass may run them on another op.
+    _experts_cls: type[nn.Module] = Qwen3_5MoeMLP
+
     def __init__(self, model: nn.Module):
         super().__init__()
         self.num_experts = model.gate.num_experts
@@ -61,7 +64,7 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         gate = nn.Linear(gate_weight.shape[1], gate_weight.shape[0], bias=False)
         gate.weight = model.gate.weight
         self.gate = gate
-        self.experts = Qwen3_5MoeMLP(model.experts, self.top_k)
+        self.experts = self._experts_cls(model.experts, self.top_k)
         self.shared_expert = model.shared_expert
         self.shared_expert_gate = model.shared_expert_gate
 

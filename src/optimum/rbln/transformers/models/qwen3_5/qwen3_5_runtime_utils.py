@@ -60,14 +60,17 @@ class RBLNQwen3_5RuntimeModel(RBLNRuntimeModel):
         self._valid_mask_prefill_full = torch.ones(1, self.rbln_config.prefill_chunk_size, 1, dtype=state_dtype)
 
     def _run(self, named_inputs: dict):
-        """Order inputs by the runtime's own signature and invoke; return (logits, hidden_states).
+        """Order inputs by the runtime's own signature and invoke; return `_split_outputs` of the raw outputs."""
+        order = self.runtime._index_to_input_name
+        args = [named_inputs[order[k]] for k in range(len(order))]
+        return self._split_outputs(super(RBLNRuntimeModel, self).forward(*args))
+
+    def _split_outputs(self, out):
+        """Return (logits, hidden_states) from the raw graph outputs; a subclass with extra outputs overrides this.
 
         When output_hidden_states is set, the trailing `num_hidden_layers + 1` outputs are the per-layer
         hidden states — taking the LAST n_hidden avoids having to count the new_states.
         """
-        order = self.runtime._index_to_input_name
-        args = [named_inputs[order[k]] for k in range(len(order))]
-        out = super(RBLNRuntimeModel, self).forward(*args)
         hidden_states = None
         if self.rbln_config.output_hidden_states:
             n_hidden = self.config.num_hidden_layers + 1
