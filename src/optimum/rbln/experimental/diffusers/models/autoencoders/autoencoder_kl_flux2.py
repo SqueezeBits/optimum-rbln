@@ -29,8 +29,10 @@ from typing import TYPE_CHECKING, Any
 
 import rebel
 import torch
+import torch.nn.functional as F
 from diffusers import AutoencoderKLFlux2
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
+from diffusers.models.upsampling import Upsample2D
 from rebel import RBLNCompileError
 from rebel.compile_context import CompileContext
 
@@ -59,6 +61,39 @@ logger = get_logger(__name__)
 
 def _encoder_graph_name(size: tuple[int, int]) -> str:
     return f"encoder_{size[0]}x{size[1]}"
+
+
+class _ConvTransposeUpsample2D(torch.nn.Module):
+    """`Upsample2D` of the decoder (nearest x2, then its conv) with the nearest x2 as a depthwise transposed conv with a
+    2x2 kernel of ones, which gives the same values. The `F.interpolate` resize fails to compile at some sizes
+    (rebel-compiler 0.12.1.dev163: crash with an 832 side, e.g. 1248x832) and when the decoder is spread over the
+    chiplets (`RBLN_RSD_GROUPING=1`: "Cannot find valid tiling, op=rtosa.resize2d")."""
+
+    def __init__(self, upsample: Upsample2D):
+        super().__init__()
+        self.conv = upsample.conv
+
+    def forward(self, hidden_states: torch.Tensor, output_size: int | None = None) -> torch.Tensor:
+        channels = hidden_states.shape[1]
+        ones = hidden_states.new_ones(channels, 1, 2, 2)
+        return self.conv(F.conv_transpose2d(hidden_states, ones, stride=2, groups=channels))
+
+
+def _decoder_with_conv_transpose_upsampling(model: AutoencoderKLFlux2) -> _VAEDecoder:
+    """`_VAEDecoder` of `model` with its nearest-x2 upsamplers replaced by `_ConvTransposeUpsample2D` (the model is
+    only traced afterwards; its `bn` statistics, the one part used at run time, are untouched)."""
+    for block in model.decoder.up_blocks:
+        for i, up in enumerate(block.upsamplers or []):
+            if (
+                isinstance(up, Upsample2D)
+                and up.interpolate
+                and up.use_conv
+                and not up.use_conv_transpose
+                and up.norm is None
+                and up.name == "conv"
+            ):
+                block.upsamplers[i] = _ConvTransposeUpsample2D(up)
+    return _VAEDecoder(model).eval()
 
 
 @experimental
@@ -153,7 +188,7 @@ class RBLNAutoencoderKLFlux2(RBLNAutoencoderKL):
                 "device": rbln_config.device_map[name],
             }
             if name == "decoder":
-                compiled_models[name] = cls.compile(_VAEDecoder(model).eval(), **compile_kwargs)
+                compiled_models[name] = cls.compile(_decoder_with_conv_transpose_upsampling(model), **compile_kwargs)
                 continue
             try:
                 compiled_models[name] = cls.compile(
