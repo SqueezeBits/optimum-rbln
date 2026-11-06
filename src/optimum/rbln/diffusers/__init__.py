@@ -30,6 +30,7 @@ ALL_IMPORTABLE_CLASSES.update(LOADABLE_CLASSES["optimum.rbln"])
 if TYPE_CHECKING:
     from .configurations import *
     from .modeling_diffusers import *
+    from .modeling_modular_diffusers import *
     from .models import *
     from .pipelines import *
 else:
