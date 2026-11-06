@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from .cogvideo import *
     from .controlnet import *
     from .cosmos import *
+    from .flux3 import *
     from .kandinsky2_2 import *
     from .stable_diffusion import *
     from .stable_diffusion_3 import *

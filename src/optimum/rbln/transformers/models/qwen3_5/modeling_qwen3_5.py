@@ -797,6 +797,10 @@ class RBLNQwen3_5ForConditionalGeneration(RBLNQwenVLBatchSortMixin, RBLNQwen3_5M
         super().__post_init__(**kwargs)
         self.rope_deltas = torch.zeros(self.rbln_config.batch_size)
 
+    @classmethod
+    def update_rbln_config_using_pipe(cls, pipe: Any, rbln_config: Any, submodule_name: str) -> Any:
+        return rbln_config
+
     @property
     def logits_last_dim(self):
         return self.config.get_text_config().vocab_size

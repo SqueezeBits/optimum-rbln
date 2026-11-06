@@ -45,6 +45,7 @@ from ....modeling import RBLNModel
 from ....modeling_base import Preprocessor
 from ....utils.logging import get_logger
 from ...configurations import RBLNFlux3Transformer2DModelConfig
+from ...configurations.pipelines.configuration_flux3 import check_flux3_pipeline
 
 
 if TYPE_CHECKING:
@@ -365,7 +366,9 @@ class RBLNFlux3Transformer2DModel(RBLNModel):
     def update_rbln_config_using_pipe(
         cls, pipe: "RBLNDiffusionMixin", rbln_config: "RBLNDiffusionMixinConfig", submodule_name: str
     ) -> "RBLNDiffusionMixinConfig":
-        # The FLUX.3 pipeline fills in the latent size, the text lengths and the rotary scale from its own blocks.
+        # The FLUX.3 pipeline config sets the latent size, the text lengths and the rotary scale for the diffusers
+        # pipeline's values; check that this pipeline has them.
+        check_flux3_pipeline(pipe)
         return rbln_config
 
     @classmethod
